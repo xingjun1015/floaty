@@ -1,0 +1,870 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    os::windows::process::CommandExt,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering::Relaxed},
+        Mutex,
+    },
+    time::Duration,
+};
+
+use serde::Serialize;
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, State, WebviewWindow,
+};
+use tauri_plugin_autostart::ManagerExt as _;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_opener::OpenerExt;
+
+const NO_WINDOW: u32 = 0x0800_0000;
+// the UI pads the island by 10px; this keeps the island about 12px from the screen edge
+const MARGIN: f64 = 2.0;
+
+// ---------------------------------------------------------------- state
+
+struct St {
+    dock: Mutex<String>,
+    sizes: Mutex<HashMap<String, (f64, f64)>>,
+    mon: Mutex<HashMap<String, usize>>,
+    shown: Mutex<HashSet<String>>,
+    fs_hidden: Mutex<HashSet<String>>,
+    hide_fs: AtomicBool,
+    on_top: AtomicBool,
+}
+
+impl Default for St {
+    fn default() -> Self {
+        St {
+            dock: Mutex::new("b".into()),
+            sizes: Mutex::new(HashMap::new()),
+            mon: Mutex::new(HashMap::new()),
+            shown: Mutex::new(HashSet::new()),
+            fs_hidden: Mutex::new(HashSet::new()),
+            hide_fs: AtomicBool::new(true),
+            on_top: AtomicBool::new(true),
+        }
+    }
+}
+
+/// (horizontal, vertical) anchor: -1 start, 0 center, 1 end
+fn parts(dock: &str) -> (i8, i8) {
+    match dock {
+        "tl" => (-1, -1),
+        "t" => (0, -1),
+        "tr" => (1, -1),
+        "l" => (-1, 0),
+        "r" => (1, 0),
+        "bl" => (-1, 1),
+        "br" => (1, 1),
+        _ => (0, 1),
+    }
+}
+
+/// Monitors in a stable order: primary first, then left-to-right, top-to-bottom.
+fn mons(app: &AppHandle) -> Vec<tauri::Monitor> {
+    let mut v = app.available_monitors().unwrap_or_default();
+    let p = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| (m.position().x, m.position().y));
+    v.sort_by_key(|m| {
+        (
+            Some((m.position().x, m.position().y)) != p,
+            m.position().x,
+            m.position().y,
+        )
+    });
+    v
+}
+
+// ---------------------------------------------------------------- docking
+
+/// Physical (x, y, width, height) for a window of logical size lw x lh docked on its monitor.
+fn target(w: &WebviewWindow, st: &St, lw: f64, lh: f64) -> Option<(i32, i32, i32, i32)> {
+    let ms = mons(w.app_handle());
+    let idx = st.mon.lock().unwrap().get(w.label()).copied().unwrap_or(0);
+    let m = ms.get(idx).or_else(|| ms.first())?;
+    let wa = m.work_area();
+    let sf = m.scale_factor();
+    let (pw, ph) = ((lw * sf).round() as i32, (lh * sf).round() as i32);
+    let (hx, vy) = parts(&st.dock.lock().unwrap());
+    let mg = (MARGIN * sf) as i32;
+    let (ax, ay) = (wa.position.x, wa.position.y);
+    let (aw, ah) = (wa.size.width as i32, wa.size.height as i32);
+    // the window may ask for more than the screen (fixed tall canvas): keep it on its monitor
+    let (pw, ph) = (pw.min(aw - 2 * mg), ph.min(ah - 2 * mg));
+    let x = match hx {
+        -1 => ax + mg,
+        1 => ax + aw - pw - mg,
+        _ => ax + (aw - pw) / 2,
+    };
+    let y = match vy {
+        -1 => ay + mg,
+        1 => ay + ah - ph - mg,
+        _ => ay + (ah - ph) / 2,
+    };
+    Some((x, y, pw, ph))
+}
+
+/// Re-dock at the stored size (size, dock position or screen changed). Size and position go in a
+/// single SetWindowPos so the window is never seen at the new size in the old spot.
+fn place(w: &WebviewWindow, st: &St) {
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER},
+    };
+    let (lw, lh) = st
+        .sizes
+        .lock()
+        .unwrap()
+        .get(w.label())
+        .copied()
+        .unwrap_or((300.0, 120.0));
+    if let (Some((x, y, pw, ph)), Ok(h)) = (target(w, st, lw, lh), w.hwnd()) {
+        unsafe {
+            let _ = SetWindowPos(HWND(h.0), None, x, y, pw, ph, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+}
+
+fn place_all(app: &AppHandle) {
+    let st = app.state::<St>();
+    for w in app.webview_windows().values() {
+        place(w, &st);
+    }
+}
+
+// ---------------------------------------------------------------- window commands
+
+#[tauri::command]
+fn fit(w: WebviewWindow, st: State<St>, width: f64, height: f64) {
+    st.sizes.lock().unwrap().insert(
+        w.label().to_string(),
+        (width.ceil().max(8.0), height.ceil().max(8.0)),
+    );
+    place(&w, &st);
+    if st.shown.lock().unwrap().insert(w.label().to_string()) {
+        guard_frame(&w);
+        strip_frame(&w);
+        let _ = w.show();
+    }
+}
+
+/// Limit painting and clicks to rect (logical x, y, w, h inside the window); None = whole window.
+/// The window itself never resizes while the island morphs: a resized WebView2 shows stale, shifted
+/// or clipped frames for a moment, a region change does not.
+#[tauri::command]
+fn clip(w: WebviewWindow, rect: Option<[f64; 4]>) {
+    use windows::Win32::{
+        Foundation::HWND,
+        Graphics::Gdi::{CreateRectRgn, SetWindowRgn},
+    };
+    let Ok(h) = w.hwnd() else { return };
+    let sf = w.scale_factor().unwrap_or(1.0);
+    unsafe {
+        let rgn = rect.map(|[x, y, rw, rh]| {
+            CreateRectRgn((x * sf).floor() as i32, (y * sf).floor() as i32, ((x + rw) * sf).ceil() as i32, ((y + rh) * sf).ceil() as i32)
+        });
+        // the system owns the region after this call
+        let _ = SetWindowRgn(HWND(h.0), rgn, true);
+    }
+}
+
+/// Tao keeps WS_CAPTION | WS_SYSMENU on undecorated windows and only hides the title bar by making the client
+/// area cover it. Any activation change makes Windows repaint that hidden title bar: a white strip flashing over
+/// the island. Strip the bits for good (idempotent, re-applied if tao puts them back, e.g. on show()).
+fn strip_frame(w: &WebviewWindow) {
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_MAXIMIZEBOX,
+            WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+        },
+    };
+    let Ok(h) = w.hwnd() else { return };
+    unsafe {
+        let h = HWND(h.0);
+        let cur = GetWindowLongPtrW(h, GWL_STYLE);
+        let bits =
+            (WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME).0 as isize;
+        if cur & bits != 0 {
+            SetWindowLongPtrW(h, GWL_STYLE, cur & !bits);
+            let _ = SetWindowPos(
+                h,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+/// tao puts the frame style bits back whenever it rewrites the window styles (show, always-on-top...).
+fn watch_frame(app: AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        for w in app.webview_windows().values() {
+            strip_frame(w);
+        }
+    });
+}
+
+/// Window-proc filter: never let Windows paint the (hidden) non-client area. Deactivating the window made
+/// DefWindowProc paint a title bar into the transparent surface, which then stayed visible above the island.
+unsafe extern "system" fn nc_guard(
+    h: windows::Win32::Foundation::HWND,
+    m: u32,
+    wp: windows::Win32::Foundation::WPARAM,
+    lp: windows::Win32::Foundation::LPARAM,
+    _id: usize,
+    _data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::{
+        Foundation::{LPARAM, LRESULT},
+        UI::{
+            Shell::DefSubclassProc,
+            WindowsAndMessaging::{WM_NCACTIVATE, WM_NCPAINT},
+        },
+    };
+    match m {
+        // 0xAE / 0xAF: undocumented "draw caption" / "draw frame" messages sent by the theme code
+        WM_NCPAINT | 0xAE | 0xAF => LRESULT(0),
+        // lParam -1: update the active state but do not repaint the frame
+        WM_NCACTIVATE => DefSubclassProc(h, m, wp, LPARAM(-1)),
+        _ => DefSubclassProc(h, m, wp, lp),
+    }
+}
+
+fn guard_frame(w: &WebviewWindow) {
+    let Ok(h) = w.hwnd() else { return };
+    let raw = h.0 as isize;
+    // also switch DWM's non-client rendering off for this window
+    unsafe {
+        use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_NCRENDERING_POLICY};
+        let policy = DWMNCRP_DISABLED;
+        let _ = DwmSetWindowAttribute(
+            windows::Win32::Foundation::HWND(h.0),
+            DWMWA_NCRENDERING_POLICY,
+            &policy as *const _ as *const _,
+            std::mem::size_of_val(&policy) as u32,
+        );
+    }
+    // SetWindowSubclass only works from the thread that owns the window
+    let _ = w.run_on_main_thread(move || unsafe {
+        let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+            windows::Win32::Foundation::HWND(raw as *mut _),
+            Some(nc_guard),
+            1,
+            0,
+        );
+    });
+}
+
+#[tauri::command]
+fn set_dock(app: AppHandle, st: State<St>, dock: String) {
+    *st.dock.lock().unwrap() = dock;
+    place_all(&app);
+}
+
+#[tauri::command]
+fn set_on_top(app: AppHandle, st: State<St>, on: bool) {
+    st.on_top.store(on, Relaxed);
+    for w in app.webview_windows().values() {
+        let _ = w.set_always_on_top(on);
+    }
+}
+
+#[tauri::command]
+fn set_hide_fs(st: State<St>, on: bool) {
+    st.hide_fs.store(on, Relaxed);
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, on: bool) -> Result<(), String> {
+    let l = app.autolaunch();
+    (if on { l.enable() } else { l.disable() }).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct MonInfo {
+    index: usize,
+    width: u32,
+    height: u32,
+    primary: bool,
+}
+
+#[tauri::command]
+fn list_monitors(app: AppHandle) -> Vec<MonInfo> {
+    mons(&app)
+        .iter()
+        .enumerate()
+        .map(|(i, m)| MonInfo {
+            index: i,
+            width: m.size().width,
+            height: m.size().height,
+            primary: i == 0,
+        })
+        .collect()
+}
+
+// mode is "all" or a monitor index. The first wanted monitor keeps the main window,
+// every extra monitor gets its own window (m<index>) running the same UI.
+// async: building windows from a sync command deadlocks on Windows
+#[tauri::command(async)]
+fn set_screens(app: AppHandle, st: State<St>, mode: String) -> Result<(), String> {
+    let n = mons(&app).len().max(1);
+    let want: Vec<usize> = if mode == "all" {
+        (0..n).collect()
+    } else {
+        vec![mode.parse::<usize>().unwrap_or(0).min(n - 1)]
+    };
+    let label = |i: usize| {
+        if i == want[0] {
+            "main".to_string()
+        } else {
+            format!("m{i}")
+        }
+    };
+    {
+        let mut m = st.mon.lock().unwrap();
+        m.clear();
+        for &i in &want {
+            m.insert(label(i), i);
+        }
+    }
+    for (l, w) in app.webview_windows() {
+        if l != "main" && !want.iter().any(|&i| label(i) == l) {
+            st.shown.lock().unwrap().remove(&l);
+            let _ = w.destroy();
+        }
+    }
+    for &i in &want {
+        let l = label(i);
+        match app.get_webview_window(&l) {
+            Some(w) => place(&w, &st),
+            None => {
+                tauri::WebviewWindowBuilder::new(
+                    &app,
+                    &l,
+                    tauri::WebviewUrl::App("index.html".into()),
+                )
+                .title("Floaty")
+                .inner_size(300.0, 120.0)
+                .decorations(false)
+                .transparent(true)
+                .always_on_top(st.on_top.load(Relaxed))
+                .skip_taskbar(true)
+                .resizable(false)
+                .shadow(false)
+                .visible(false)
+                .build()
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn show_all(app: &AppHandle) {
+    app.state::<St>().fs_hidden.lock().unwrap().clear();
+    for w in app.webview_windows().values() {
+        let _ = w.show();
+    }
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.set_focus();
+    }
+}
+
+fn toggle(app: &AppHandle) {
+    if app
+        .webview_windows()
+        .values()
+        .any(|w| w.is_visible().unwrap_or(false))
+    {
+        for w in app.webview_windows().values() {
+            let _ = w.hide();
+        }
+    } else {
+        show_all(app);
+    }
+}
+
+fn hotkey(app: &AppHandle) {
+    let hidden = app
+        .webview_windows()
+        .values()
+        .any(|w| !w.is_visible().unwrap_or(true));
+    show_all(app);
+    let _ = app.emit("hotkey", if hidden { "expand" } else { "toggle" });
+}
+
+// ---------------------------------------------------------------- fullscreen watcher
+
+/// Top-left of the monitor hosting a fullscreen foreground window that is not ours.
+fn fullscreen_monitor(own: &HashSet<isize>) -> Option<(i32, i32)> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowRect,
+    };
+    unsafe {
+        let h = GetForegroundWindow();
+        if h.0.is_null() || own.contains(&(h.0 as isize)) {
+            return None;
+        }
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(h, &mut cls).max(0) as usize;
+        let c = String::from_utf16_lossy(&cls[..n]);
+        if matches!(c.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+            return None;
+        }
+        let mut r = windows::Win32::Foundation::RECT::default();
+        GetWindowRect(h, &mut r).ok()?;
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+            return None;
+        }
+        let m = mi.rcMonitor;
+        (r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom)
+            .then_some((m.left, m.top))
+    }
+}
+
+fn watch_fullscreen(app: AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let st = app.state::<St>();
+        let wins = app.webview_windows();
+        let own: HashSet<isize> = wins
+            .values()
+            .filter_map(|w| w.hwnd().ok().map(|h| h.0 as isize))
+            .collect();
+        let fs = if st.hide_fs.load(Relaxed) {
+            fullscreen_monitor(&own)
+        } else {
+            None
+        };
+        let ms = mons(&app);
+        for (label, w) in &wins {
+            let idx = st.mon.lock().unwrap().get(label).copied().unwrap_or(0);
+            let pos = ms.get(idx).map(|m| (m.position().x, m.position().y));
+            let full = fs.is_some() && fs == pos;
+            if full && w.is_visible().unwrap_or(false) {
+                st.fs_hidden.lock().unwrap().insert(label.clone());
+                let _ = w.hide();
+            } else if !full && st.fs_hidden.lock().unwrap().remove(label) {
+                let _ = w.show();
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------- items
+
+#[derive(Serialize)]
+struct Item {
+    name: String,
+    path: String,
+    kind: &'static str,
+    exe: Option<String>,
+}
+
+fn resolve_lnk(p: &str) -> Option<String> {
+    use windows::{
+        core::{Interface, PCWSTR},
+        Win32::{
+            System::Com::{
+                CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER,
+                COINIT_APARTMENTTHREADED, STGM_READ,
+            },
+            UI::Shell::{IShellLinkW, ShellLink},
+        },
+    };
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let pf: IPersistFile = link.cast().ok()?;
+        let wide: Vec<u16> = p.encode_utf16().chain(Some(0)).collect();
+        pf.Load(PCWSTR(wide.as_ptr()), STGM_READ).ok()?;
+        let mut buf = [0u16; 260];
+        link.GetPath(&mut buf, std::ptr::null_mut(), 0).ok()?;
+        let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..n])).filter(|s| !s.is_empty())
+    }
+}
+
+fn exe_name(p: &str) -> Option<String> {
+    let f = Path::new(p).file_name()?.to_string_lossy().to_lowercase();
+    f.ends_with(".exe").then_some(f)
+}
+
+#[tauri::command(async)]
+fn classify(paths: Vec<String>) -> Vec<Item> {
+    paths
+        .into_iter()
+        .map(|p| {
+            let path = Path::new(&p);
+            let ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let (kind, exe, name) = if path.is_dir() {
+                (
+                    "folder",
+                    None,
+                    path.file_name().map(|n| n.to_string_lossy().into_owned()),
+                )
+            } else if matches!(
+                ext.as_str(),
+                "exe" | "lnk" | "bat" | "cmd" | "msi" | "appref-ms"
+            ) {
+                let exe = match ext.as_str() {
+                    "exe" => exe_name(&p),
+                    "lnk" => resolve_lnk(&p).and_then(|t| exe_name(&t)),
+                    _ => None,
+                };
+                (
+                    "app",
+                    exe,
+                    path.file_stem().map(|n| n.to_string_lossy().into_owned()),
+                )
+            } else {
+                (
+                    "file",
+                    None,
+                    path.file_name().map(|n| n.to_string_lossy().into_owned()),
+                )
+            };
+            Item {
+                name: name.unwrap_or_else(|| p.clone()),
+                path: p,
+                kind,
+                exe,
+            }
+        })
+        .collect()
+}
+
+#[tauri::command(async)]
+fn launch(app: AppHandle, kind: String, path: String) -> Result<(), String> {
+    match kind.as_str() {
+        "url" => app
+            .opener()
+            .open_url(path, None::<&str>)
+            .map_err(|e| e.to_string()),
+        "cmd" => Command::new("cmd")
+            .raw_arg(format!("/C {path}"))
+            .creation_flags(NO_WINDOW)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        _ => app
+            .opener()
+            .open_path(path, None::<&str>)
+            .map_err(|e| e.to_string()),
+    }
+}
+
+#[tauri::command(async)]
+fn run_admin(path: String) -> Result<(), String> {
+    let q = path.replace('\'', "''");
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &format!("Start-Process -FilePath '{q}' -Verb RunAs"),
+        ])
+        .creation_flags(NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn reveal(path: String) -> Result<(), String> {
+    Command::new("explorer")
+        .raw_arg(format!("/select,\"{path}\""))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn running_exes() -> Vec<String> {
+    use windows::Win32::{
+        Foundation::CloseHandle,
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+    let mut set = HashSet::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return vec![];
+        };
+        let mut e = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(260);
+                set.insert(String::from_utf16_lossy(&e.szExeFile[..n]).to_lowercase());
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    set.into_iter().collect()
+}
+
+#[derive(Serialize)]
+struct Entry {
+    name: String,
+    path: String,
+}
+
+fn walk(dir: &Path, depth: u8, out: &mut Vec<Entry>) {
+    if depth > 3 {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            walk(&p, depth + 1, out);
+        } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
+            let name = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !name.to_lowercase().contains("uninstall") {
+                out.push(Entry {
+                    name,
+                    path: p.to_string_lossy().into_owned(),
+                });
+            }
+        }
+    }
+}
+
+#[tauri::command(async)]
+fn start_menu() -> Vec<Entry> {
+    let mut v = vec![];
+    for var in ["ProgramData", "APPDATA"] {
+        if let Some(b) = std::env::var_os(var) {
+            walk(
+                &PathBuf::from(b).join(r"Microsoft\Windows\Start Menu\Programs"),
+                0,
+                &mut v,
+            );
+        }
+    }
+    v.sort_by_key(|e| e.name.to_lowercase());
+    v.dedup_by_key(|e| e.name.to_lowercase());
+    v
+}
+
+// ---------------------------------------------------------------- widgets
+
+#[tauri::command(async)]
+fn read_clipboard() -> Option<String> {
+    arboard::Clipboard::new()
+        .ok()?
+        .get_text()
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+}
+
+#[derive(Serialize, Default)]
+struct Media {
+    active: bool,
+    playing: bool,
+    title: String,
+    artist: String,
+}
+
+fn media_now() -> windows::core::Result<Media> {
+    use windows::Media::Control::{
+        GlobalSystemMediaTransportControlsSessionManager as Mgr,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus as Ps,
+    };
+    let s = Mgr::RequestAsync()?.get()?.GetCurrentSession()?;
+    let p = s.TryGetMediaPropertiesAsync()?.get()?;
+    let playing = s.GetPlaybackInfo()?.PlaybackStatus()? == Ps::Playing;
+    Ok(Media {
+        active: true,
+        playing,
+        title: p.Title()?.to_string(),
+        artist: p.Artist()?.to_string(),
+    })
+}
+
+#[tauri::command(async)]
+fn media_info() -> Media {
+    media_now().unwrap_or_default()
+}
+
+#[tauri::command(async)]
+fn media_ctl(op: String) {
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager as Mgr;
+    let _ = (|| -> windows::core::Result<bool> {
+        let s = Mgr::RequestAsync()?.get()?.GetCurrentSession()?;
+        match op.as_str() {
+            "toggle" => s.TryTogglePlayPauseAsync()?.get(),
+            "next" => s.TrySkipNextAsync()?.get(),
+            _ => s.TrySkipPreviousAsync()?.get(),
+        }
+    })();
+}
+
+// ---------------------------------------------------------------- config
+
+fn cfg_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let d = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+    Ok(d.join("config.json"))
+}
+
+#[tauri::command]
+fn load_config(app: AppHandle) -> Option<String> {
+    fs::read_to_string(cfg_path(&app).ok()?).ok()
+}
+
+#[tauri::command]
+fn save_config(app: AppHandle, w: WebviewWindow, text: String) -> Result<(), String> {
+    let p = cfg_path(&app)?;
+    let tmp = p.with_extension("tmp");
+    fs::write(&tmp, &text).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
+    if app.webview_windows().len() > 1 {
+        let _ = app.emit(
+            "cfg",
+            serde_json::json!({ "from": w.label(), "text": text }),
+        );
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn export_config(app: AppHandle, dest: String) -> Result<(), String> {
+    fs::copy(cfg_path(&app)?, dest)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn import_config(src: String) -> Result<String, String> {
+    let text = fs::read_to_string(src).map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    if v.get("profiles").is_none() {
+        return Err("not a Floaty config".into());
+    }
+    Ok(text)
+}
+
+// ---------------------------------------------------------------- main
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            show_all(app)
+        }))
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _, ev| {
+                    if ev.state() == ShortcutState::Pressed {
+                        hotkey(app);
+                    }
+                })
+                .build(),
+        )
+        .manage(St::default())
+        .invoke_handler(tauri::generate_handler![
+            fit,
+            clip,
+            set_dock,
+            set_on_top,
+            set_hide_fs,
+            set_autostart,
+            set_screens,
+            list_monitors,
+            classify,
+            launch,
+            run_admin,
+            reveal,
+            running_exes,
+            start_menu,
+            read_clipboard,
+            media_info,
+            media_ctl,
+            load_config,
+            save_config,
+            export_config,
+            import_config
+        ])
+        .setup(|app| {
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &MenuItem::with_id(app, "toggle", "Show / Hide", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?,
+                ],
+            )?;
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("Floaty")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, e| match e.id.as_ref() {
+                    "toggle" => toggle(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|t, e| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = e
+                    {
+                        toggle(t.app_handle());
+                    }
+                })
+                .build(app)?;
+            // ponytail: fixed hotkey; make configurable if Alt+Space collides with another tool
+            let _ = app.global_shortcut().register("Alt+Space");
+            watch_fullscreen(app.handle().clone());
+            watch_frame(app.handle().clone());
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running Floaty");
+}

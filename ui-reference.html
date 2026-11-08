@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Floating island UI</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/dist/tabler-icons.min.css">
+<style>
+/*
+  FLOATING ISLAND UI (Dynamic Island style)
+  -----------------------------------------
+  - One pill element (#isl) that morphs between states.
+  - Each state has a compact and an expanded layout (see STATES in the script).
+  - Width, height and border-radius are animated together with a springy
+    cubic-bezier. Content fades out and back in during the resize.
+  - Glass theme: translucent dark tint + backdrop-filter blur + saturation,
+    thin bright edge and top highlight. Solid theme: plain black.
+  - Quick access state: pinned shortcut grid (max 8), tap to open, Edit to
+    remove, plus tile to add, drop a file/text onto the island to pin it.
+*/
+
+:root{
+  /* island motion */
+  --spring: cubic-bezier(.34,1.35,.5,1);
+  --spring-dur: .55s;
+  --fade-dur: .16s;
+
+  /* island sizing */
+  --compact-h: 36px;
+  --expanded-radius: 36px;
+
+  /* glass defaults (also controlled by the sliders) */
+  --glass-tint-rgb: 14,14,28;
+  --glass-saturate: 180%;
+
+  /* page chrome */
+  --page-bg: #0b0b12;
+  --panel-bg: #15151f;
+  --panel-border: rgba(255,255,255,.1);
+  --text: #f2f2f7;
+  --text-2: #a1a1aa;
+  --accent: #0a84ff;
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0;padding:24px;background:var(--page-bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  display:flex;justify-content:center;
+}
+.wrap{width:100%;max-width:700px;background:var(--panel-bg);border:.5px solid var(--panel-border);border-radius:16px;padding:12px}
+
+/* ---------- wallpaper stage (gives the glass something to blur) ---------- */
+#stage{
+  position:relative;height:310px;border-radius:12px;overflow:hidden;
+  background:linear-gradient(135deg,#1e3a8a 0%,#7c3aed 50%,#db2777 100%);
+}
+.blob{position:absolute;border-radius:50%}
+@keyframes d1{from{transform:translateX(-90px)}to{transform:translateX(90px)}}
+@keyframes d2{from{transform:translate(70px,0)}to{transform:translate(-80px,30px)}}
+@keyframes d3{from{transform:translate(-40px,20px)}to{transform:translate(60px,-10px)}}
+.card-bg{position:absolute;left:14%;right:14%;border-radius:14px;background:rgba(255,255,255,.14);padding:14px 18px;color:#fff;font-size:12px;line-height:1.6}
+
+/* ---------- the island ---------- */
+#isl{
+  position:absolute;left:50%;top:16px;transform:translateX(-50%);
+  color:#fff;overflow:hidden;cursor:pointer;
+  transition:
+    width var(--spring-dur) var(--spring),
+    height var(--spring-dur) var(--spring),
+    border-radius var(--spring-dur) var(--spring),
+    background .3s;
+}
+#isl.drop{outline:2px solid #fff;outline-offset:2px}
+#in{width:100%;height:100%;transition:opacity var(--fade-dur) ease}
+
+/* animated music bars */
+.bar{display:inline-block;width:3px;border-radius:2px;background:#FF375F;animation:bw .9s ease-in-out infinite}
+.paused .bar{animation-play-state:paused}
+.bar:nth-child(2){animation-delay:.2s}
+.bar:nth-child(3){animation-delay:.4s}
+.bar:nth-child(4){animation-delay:.1s}
+@keyframes bw{0%,100%{height:5px}50%{height:16px}}
+
+/* round action buttons inside the island */
+.cb{border:none;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;cursor:pointer;padding:0}
+
+/* quick access tiles */
+.tl{display:flex;flex-direction:column;align-items:center;gap:6px;cursor:pointer;position:relative;min-width:0}
+.tl span.n{font-size:11px;color:rgba(255,255,255,.8);max-width:64px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tx{background:none;border:none;color:#fff;font-size:13px;font-weight:500;cursor:pointer;padding:0;font-family:inherit}
+
+/* ---------- demo controls (not part of the island) ---------- */
+.controls{display:flex;flex-direction:column;gap:10px;margin-top:14px;padding:0 4px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.row.center{justify-content:center;margin-top:14px}
+.label{font-size:13px;color:var(--text-2);margin-right:4px}
+button.pill{
+  font:inherit;font-size:13px;color:var(--text);background:transparent;
+  border:.5px solid var(--panel-border);border-radius:8px;padding:6px 12px;cursor:pointer;
+}
+button.pill:hover{background:rgba(255,255,255,.06)}
+button.pill.on{border-color:var(--accent);font-weight:500}
+.ctl{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text-2)}
+.ctl input{flex:1}
+.ctl output{min-width:34px;text-align:right;color:var(--text);font-variant-numeric:tabular-nums}
+.hint{font-size:13px;color:var(--text-2);text-align:center;margin:10px 0 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div id="stage">
+    <div class="blob" style="left:30%;top:90px;width:150px;height:150px;background:#FF9F0A;animation:d1 8s ease-in-out infinite alternate"></div>
+    <div class="blob" style="left:52%;top:20px;width:120px;height:120px;background:#30D5C8;animation:d2 7s ease-in-out infinite alternate"></div>
+    <div class="blob" style="left:44%;top:150px;width:110px;height:110px;background:#A3E635;animation:d3 9s ease-in-out infinite alternate"></div>
+
+    <div class="card-bg" style="top:76px">
+      <div style="font-size:15px;font-weight:500">Q4 roadmap review</div>
+      <div style="color:rgba(255,255,255,.75);margin-top:6px">Ship the new onboarding flow, finalise pricing page copy, and close out the accessibility audit before the December freeze.</div>
+    </div>
+    <div class="card-bg" style="top:200px;padding:12px 18px">Notes: review timer, call Siti at 3pm, upload the final design files to the shared folder.</div>
+
+    <div id="isl" role="button" tabindex="0" aria-label="Floating island, tap to expand or collapse">
+      <div id="in"></div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <div class="row" id="themes"><span class="label">Theme</span></div>
+    <label class="ctl">Blur <input type="range" id="blur" min="0" max="40" step="1" value="24"><output id="blurO">24px</output></label>
+    <label class="ctl">Tint <input type="range" id="tint" min="0" max="80" step="1" value="30"><output id="tintO">30%</output></label>
+  </div>
+  <div class="row center" id="btns"></div>
+  <p class="hint">Tap the island to expand it. In Quick access: tap a tile to open, Edit to remove, plus to add, or drop a file onto the island.</p>
+</div>
+
+<script>
+/* =========================================================
+   STATE
+   ========================================================= */
+var isl = document.getElementById('isl');
+var inn = document.getElementById('in');
+var stateBar = document.getElementById('btns');
+var themeBar = document.getElementById('themes');
+
+var cur = 'quick';        // active island state: idle | quick | music | timer | call | charge
+var exp = true;           // expanded or compact
+var glass = true;         // glass theme on/off
+var playing = true;       // music playing
+var running = true;       // timer running
+var timer = 272;          // timer seconds remaining
+var callT = 12;           // call seconds elapsed
+var mode = 'grid';        // quick access: 'grid' | 'add'
+var editing = false;      // quick access edit mode
+var msg = '', msgT = null; // quick access flash message
+
+/* =========================================================
+   QUICK ACCESS DATA
+   Each item: id, name, Tabler icon name, icon colour, tile background
+   ========================================================= */
+var POOL = [
+  {id:'mail',   name:'Mail',      icon:'mail',           fg:'#64B5FF', bg:'rgba(10,132,255,.35)'},
+  {id:'notes',  name:'Notes',     icon:'note',           fg:'#FFE55C', bg:'rgba(255,214,10,.3)'},
+  {id:'files',  name:'Files',     icon:'folder',         fg:'#8FE3FF', bg:'rgba(100,210,255,.3)'},
+  {id:'cal',    name:'Calendar',  icon:'calendar',       fg:'#FF7A72', bg:'rgba(255,69,58,.32)'},
+  {id:'safari', name:'Safari',    icon:'compass',        fg:'#9D9BFF', bg:'rgba(94,92,230,.38)'},
+  {id:'photos', name:'Photos',    icon:'photo',          fg:'#FFB84D', bg:'rgba(255,159,10,.32)'},
+  {id:'term',   name:'Terminal',  icon:'terminal-2',     fg:'#6BE58A', bg:'rgba(48,209,88,.3)'},
+  {id:'set',    name:'Settings',  icon:'settings',       fg:'#D1D1D6', bg:'rgba(174,174,178,.3)'},
+  {id:'cam',    name:'Camera',    icon:'camera',         fg:'#D2B48C', bg:'rgba(172,142,104,.34)'},
+  {id:'msg',    name:'Messages',  icon:'message-circle', fg:'#6BE58A', bg:'rgba(48,209,88,.3)'},
+  {id:'maps',   name:'Maps',      icon:'map-pin',        fg:'#FF7A98', bg:'rgba(255,55,95,.32)'},
+  {id:'clip',   name:'Clipboard', icon:'clipboard',      fg:'#D58CFF', bg:'rgba(191,90,242,.34)'}
+];
+var MAX_ITEMS = 8;
+var items = [POOL[0], POOL[1], POOL[2], POOL[3]];
+try { var sv = JSON.parse(localStorage.getItem('isl_q') || 'null'); if (sv && sv.length) items = sv; } catch (e) {}
+function save(){ try { localStorage.setItem('isl_q', JSON.stringify(items)); } catch (e) {} }
+
+/* =========================================================
+   SMALL HELPERS
+   ========================================================= */
+function ic(name, color, size){
+  return '<i class="ti ti-'+name+'" style="font-size:'+(size||18)+'px;color:'+(color||'#fff')+'" aria-hidden="true"></i>';
+}
+function fmt(s){ var m=Math.floor(s/60), r=s%60; return (m<10?'0':'')+m+':'+(r<10?'0':'')+r; }
+function bars(){
+  return '<span style="display:inline-flex;align-items:center;gap:3px;height:18px"><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span></span>';
+}
+/* compact layout: icon on the left, value on the right */
+function comp(left, right){
+  return '<div style="display:flex;align-items:center;justify-content:space-between;height:100%;padding:0 14px">'+left+right+'</div>';
+}
+/* 44px round action button; `act` is a JS string run on click */
+function circ(icon, bg, act, col){
+  return '<button class="cb" aria-label="'+icon+'" style="width:44px;height:44px;background:'+bg+'" onclick="event.stopPropagation();'+act+'">'+ic(icon, col||'#fff', 20)+'</button>';
+}
+
+/* =========================================================
+   QUICK ACCESS ACTIONS + VIEWS
+   ========================================================= */
+function flash(t){
+  msg = t; clearTimeout(msgT);
+  msgT = setTimeout(function(){ msg=''; if (cur==='quick' && exp) render(false); }, 1300);
+  render(false);
+}
+function openItem(i){ if (editing) return; flash('Opened '+items[i].name); }   // hook your real action here
+function rmItem(i){ items.splice(i,1); save(); render(false); }
+function addItem(id){
+  var p = POOL.filter(function(x){ return x.id===id; })[0];
+  if (p && items.length < MAX_ITEMS) items.push(p);
+  mode = 'grid'; save(); render(false);
+}
+function setMode(m){ mode = m; if (m !== 'grid') editing = false; render(false); }
+function unused(){ return POOL.filter(function(p){ return !items.some(function(i){ return i.id===p.id; }); }); }
+
+function tileIcon(it){
+  return '<div style="width:44px;height:44px;border-radius:12px;background:'+it.bg+';box-shadow:inset 0 0 0 .5px rgba(255,255,255,.25);display:flex;align-items:center;justify-content:center">'+ic(it.icon, it.fg, 22)+'</div>';
+}
+function tile(it, i){
+  var badge = editing
+    ? '<span onclick="event.stopPropagation();rmItem('+i+')" style="position:absolute;top:-4px;right:10px;width:18px;height:18px;border-radius:50%;background:#FF453A;display:flex;align-items:center;justify-content:center">'+ic('minus','#fff',12)+'</span>'
+    : '';
+  return '<div class="tl" onclick="event.stopPropagation();openItem('+i+')">'+tileIcon(it)+'<span class="n">'+it.name+'</span>'+badge+'</div>';
+}
+function plusTile(){
+  return '<div class="tl" onclick="event.stopPropagation();setMode(\'add\')"><div style="width:44px;height:44px;border-radius:12px;border:1.5px dashed rgba(255,255,255,.5);display:flex;align-items:center;justify-content:center">'+ic('plus','rgba(255,255,255,.85)',20)+'</div><span class="n">Add</span></div>';
+}
+/* island height grows with the number of grid rows */
+function qHeight(){
+  var n = mode==='add' ? unused().length : items.length + (items.length<MAX_ITEMS ? 1 : 0);
+  return 52 + Math.max(1, Math.ceil(n/4)) * 78 + 10;
+}
+function qHtml(){
+  var title = msg || (mode==='add' ? 'Add shortcut' : 'Quick access');
+  var right = mode==='add'
+    ? '<button class="tx" onclick="event.stopPropagation();setMode(\'grid\')">Cancel</button>'
+    : '<span style="display:flex;gap:14px;align-items:center"><button class="tx" onclick="event.stopPropagation();editing=!editing;render(false)">'+(editing?'Done':'Edit')+'</button><span onclick="event.stopPropagation();exp=false;render(true)" style="display:flex;cursor:pointer">'+ic('chevron-up','rgba(255,255,255,.75)',18)+'</span></span>';
+  var cells;
+  if (mode==='add'){
+    cells = unused().map(function(p){
+      return '<div class="tl" onclick="event.stopPropagation();addItem(\''+p.id+'\')">'+tileIcon(p)+'<span class="n">'+p.name+'</span></div>';
+    }).join('');
+    if (!unused().length) cells = '<div style="grid-column:1/-1;text-align:center;font-size:13px;color:rgba(255,255,255,.75);padding:18px 0">Everything is already pinned.</div>';
+  } else {
+    cells = items.map(tile).join('') + (items.length<MAX_ITEMS ? plusTile() : '');
+  }
+  return '<div style="padding:14px 18px 0" onclick="event.stopPropagation()">'
+    + '<div style="height:30px;display:flex;align-items:center;justify-content:space-between"><span style="font-size:13px;font-weight:500;color:'+(msg?'#6BE58A':'rgba(255,255,255,.8)')+'">'+title+'</span>'+right+'</div>'
+    + '<div style="display:grid;grid-template-columns:repeat(4,1fr);row-gap:12px;margin-top:8px">'+cells+'</div></div>';
+}
+function dots(){
+  return '<span style="display:inline-flex">'+items.slice(0,3).map(function(it,i){
+    return '<span style="width:20px;height:20px;border-radius:50%;background:'+it.bg+';box-shadow:0 0 0 1.5px rgba(255,255,255,.3);margin-left:'+(i?'-6px':'0')+';display:flex;align-items:center;justify-content:center">'+ic(it.icon, it.fg, 11)+'</span>';
+  }).join('')+'</span>';
+}
+
+/* =========================================================
+   STATES
+   Each state: c = compact, e = expanded.
+   w = width px, h = height px (or a function), html = render function.
+   Accent colours: music pink, timer orange, call/charge green, end-call red.
+   ========================================================= */
+var STATES = {
+  idle: { c:{ w:126, h:34, html:function(){ return '<div style="height:100%"></div>'; } } },
+
+  quick: {
+    c:{ w:200, h:36, html:function(){
+      return comp('<span style="display:flex;align-items:center;gap:8px">'+ic('layout-grid','#fff',16)+'<span style="font-size:13px;font-weight:500">'+items.length+' pinned</span></span>', dots());
+    }},
+    e:{ w:340, h:qHeight, html:qHtml }
+  },
+
+  music: {
+    c:{ w:210, h:36, html:function(){
+      return comp('<div style="width:22px;height:22px;border-radius:6px;background:#FF375F;display:flex;align-items:center;justify-content:center">'+ic('music','#fff',13)+'</div>', bars());
+    }},
+    e:{ w:340, h:148, html:function(){
+      return '<div style="padding:16px 18px;display:flex;flex-direction:column;gap:12px">'
+        + '<div style="display:flex;align-items:center;gap:12px"><div style="width:52px;height:52px;border-radius:12px;background:#FF375F;display:flex;align-items:center;justify-content:center">'+ic('music','#fff',24)+'</div>'
+        + '<div style="flex:1;min-width:0"><div style="font-size:15px;font-weight:500">Golden hour</div><div style="font-size:13px;color:rgba(255,255,255,.75)">Aria Lane</div></div>'+bars()+'</div>'
+        + '<div style="display:flex;align-items:center;gap:8px;font-size:11px;color:rgba(255,255,255,.75)"><span>1:12</span><div style="flex:1;height:4px;border-radius:2px;background:rgba(255,255,255,.28)"><div style="width:35%;height:100%;border-radius:2px;background:#fff"></div></div><span>-2:08</span></div>'
+        + '<div style="display:flex;justify-content:center;align-items:center;gap:30px">'+ic('player-skip-back','#fff',22)
+        + '<span onclick="event.stopPropagation();playing=!playing;render(false)" style="display:flex">'+ic(playing?'player-pause':'player-play','#fff',26)+'</span>'
+        + ic('player-skip-forward','#fff',22)+'</div></div>';
+    }}
+  },
+
+  timer: {
+    c:{ w:150, h:36, html:function(){
+      return comp(ic('hourglass','#FFB84D',16), '<span data-t="timer" style="font-size:14px;font-weight:500;color:#FFB84D;font-variant-numeric:tabular-nums">'+fmt(timer)+'</span>');
+    }},
+    e:{ w:340, h:104, html:function(){
+      return '<div style="padding:16px 18px;display:flex;align-items:center;justify-content:space-between"><div><div style="font-size:12px;color:#FFB84D;font-weight:500">Timer</div>'
+        + '<div data-t="timer" style="font-size:36px;font-weight:500;color:#FFB84D;font-variant-numeric:tabular-nums;line-height:1.2">'+fmt(timer)+'</div></div>'
+        + '<div style="display:flex;gap:10px">'
+        + circ(running?'player-pause':'player-play','rgba(255,159,10,.35)','running=!running;render(false)','#FFB84D')
+        + circ('x','rgba(255,255,255,.22)','timer=300;render(false)')+'</div></div>';
+    }}
+  },
+
+  call: {
+    c:{ w:170, h:36, html:function(){
+      return comp(ic('phone','#6BE58A',16), '<span data-t="call" style="font-size:14px;font-weight:500;color:#6BE58A;font-variant-numeric:tabular-nums">'+fmt(callT)+'</span>');
+    }},
+    e:{ w:340, h:104, html:function(){
+      return '<div style="padding:16px 18px;display:flex;align-items:center;gap:12px">'
+        + '<div style="width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.22);display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:500">SL</div>'
+        + '<div style="flex:1"><div style="font-size:15px;font-weight:500">Siti Lim</div><div data-t="call" style="font-size:13px;color:#6BE58A;font-variant-numeric:tabular-nums">'+fmt(callT)+'</div></div>'
+        + circ('microphone-off','rgba(255,255,255,.22)','')
+        + circ('phone-off','#FF453A','callT=0;render(false)')+'</div>';
+    }}
+  },
+
+  charge: {
+    c:{ w:190, h:36, html:function(){
+      return comp(ic('bolt','#6BE58A',16), '<span style="font-size:14px;font-weight:500;color:#6BE58A">82%</span>');
+    }},
+    e:{ w:300, h:92, html:function(){
+      return '<div style="padding:16px 20px;display:flex;flex-direction:column;gap:10px">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center"><div style="display:flex;align-items:center;gap:8px">'+ic('battery-charging','#6BE58A',22)+'<span style="font-size:15px;font-weight:500">Charging</span></div><span style="font-size:22px;font-weight:500;color:#6BE58A">82%</span></div>'
+        + '<div style="height:6px;border-radius:3px;background:rgba(255,255,255,.28)"><div style="width:82%;height:100%;border-radius:3px;background:#6BE58A"></div></div></div>';
+    }}
+  }
+};
+
+/* =========================================================
+   THEME (glass vs solid)
+   ========================================================= */
+function theme(){
+  var b = +document.getElementById('blur').value;
+  var t = +document.getElementById('tint').value;
+  document.getElementById('blurO').textContent = b + 'px';
+  document.getElementById('tintO').textContent = t + '%';
+
+  if (glass){
+    isl.style.background = 'rgba(14,14,28,' + (t/100) + ')';
+    var f = 'blur(' + b + 'px) saturate(180%)';
+    isl.style.backdropFilter = f;
+    isl.style.webkitBackdropFilter = f;
+    isl.style.boxShadow =
+      'inset 0 1px 0 rgba(255,255,255,.5),' +      /* top highlight */
+      'inset 0 0 0 .5px rgba(255,255,255,.35),' +  /* bright edge */
+      '0 10px 30px rgba(0,0,0,.28)';               /* lift */
+  } else {
+    isl.style.background = '#000';
+    isl.style.backdropFilter = 'none';
+    isl.style.webkitBackdropFilter = 'none';
+    isl.style.boxShadow = 'none';
+  }
+  Array.prototype.forEach.call(themeBar.querySelectorAll('button'), function(x){
+    x.classList.toggle('on', (x.dataset.k === 'glass') === glass);
+  });
+  document.getElementById('blur').disabled = !glass;
+  document.getElementById('tint').disabled = !glass;
+}
+
+/* =========================================================
+   RENDER
+   Sets size first (so CSS transitions run), then swaps content.
+   fade = true fades the old content out before swapping.
+   ========================================================= */
+function upd(){
+  document.querySelectorAll('[data-t="timer"]').forEach(function(e){ e.textContent = fmt(timer); });
+  document.querySelectorAll('[data-t="call"]').forEach(function(e){ e.textContent = fmt(callT); });
+}
+function render(fade){
+  var st = STATES[cur];
+  var d = (exp && st.e) ? st.e : st.c;
+  var h = typeof d.h === 'function' ? d.h() : d.h;
+
+  isl.style.width = d.w + 'px';
+  isl.style.height = h + 'px';
+  isl.style.borderRadius = (exp && st.e ? 36 : h/2) + 'px';
+  isl.className = playing ? '' : 'paused';
+
+  var put = function(){ inn.innerHTML = d.html(); upd(); inn.style.opacity = 1; };
+  if (fade){ inn.style.opacity = 0; setTimeout(put, 150); } else { put(); }
+}
+function markState(){
+  Array.prototype.forEach.call(stateBar.children, function(b){ b.classList.toggle('on', b.dataset.k === cur); });
+}
+
+/* =========================================================
+   WIRING
+   ========================================================= */
+[['glass','Glass'],['solid','Solid']].forEach(function(p){
+  var b = document.createElement('button');
+  b.className = 'pill'; b.textContent = p[1]; b.dataset.k = p[0];
+  b.onclick = function(){ glass = (p[0] === 'glass'); theme(); };
+  themeBar.appendChild(b);
+});
+
+[['idle','Idle'],['quick','Quick access'],['music','Music'],['timer','Timer'],['call','Call'],['charge','Charging']].forEach(function(p){
+  var b = document.createElement('button');
+  b.className = 'pill'; b.textContent = p[1]; b.dataset.k = p[0];
+  b.onclick = function(){ cur = p[0]; exp = false; mode = 'grid'; editing = false; render(true); markState(); };
+  stateBar.appendChild(b);
+});
+
+function toggle(){
+  if (cur === 'idle') return;
+  exp = !exp; mode = 'grid'; editing = false; render(true);
+}
+isl.onclick = toggle;
+isl.onkeydown = function(e){ if (e.key==='Enter' || e.key===' '){ e.preventDefault(); toggle(); } };
+
+/* drop a file or text onto the island to pin it */
+isl.ondragover = function(e){ e.preventDefault(); isl.classList.add('drop'); };
+isl.ondragleave = function(){ isl.classList.remove('drop'); };
+isl.ondrop = function(e){
+  e.preventDefault(); isl.classList.remove('drop');
+  var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  var nm = f ? f.name : (e.dataTransfer && e.dataTransfer.getData('text')) || '';
+  if (!nm || items.length >= MAX_ITEMS){ flash(items.length >= MAX_ITEMS ? 'Shelf is full' : 'Nothing to add'); return; }
+  var short = nm.length > 10 ? nm.slice(0,9) + '…' : nm;
+  items.push({id:'f'+Date.now(), name:short, icon:'file', fg:'#FFFFFF', bg:'rgba(255,255,255,.25)'});
+  save(); cur = 'quick'; exp = true; mode = 'grid'; render(true); markState(); flash('Saved ' + short);
+};
+
+document.getElementById('blur').oninput = theme;
+document.getElementById('tint').oninput = theme;
+
+/* 1s tick: timer counts down (resets at 0), call counts up */
+setInterval(function(){
+  if (running && timer > 0) timer--; else if (timer <= 0) timer = 300;
+  callT++; upd();
+}, 1000);
+
+theme(); render(false); markState();
+</script>
+</body>
+</html>
