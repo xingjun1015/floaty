@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicBool, Ordering::Relaxed},
         Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -35,6 +35,7 @@ struct St {
     mon: Mutex<HashMap<String, usize>>,
     shown: Mutex<HashSet<String>>,
     fs_hidden: Mutex<HashSet<String>>,
+    hidden: Mutex<HashSet<String>>,
     clips: Mutex<HashMap<String, [f64; 4]>>,
     hide_fs: AtomicBool,
     on_top: AtomicBool,
@@ -48,6 +49,7 @@ impl Default for St {
             mon: Mutex::new(HashMap::new()),
             shown: Mutex::new(HashSet::new()),
             fs_hidden: Mutex::new(HashSet::new()),
+            hidden: Mutex::new(HashSet::new()),
             clips: Mutex::new(HashMap::new()),
             hide_fs: AtomicBool::new(true),
             on_top: AtomicBool::new(true),
@@ -171,7 +173,9 @@ fn clip(w: WebviewWindow, st: State<St>, rect: Option<[f64; 4]>) {
         None => m.remove(w.label()),
     };
     drop(m);
-    set_region(&w, rect);
+    if !st.hidden.lock().unwrap().contains(w.label()) {
+        set_region(&w, rect);
+    }
 }
 
 fn set_region(w: &WebviewWindow, rect: Option<[f64; 4]>) {
@@ -247,6 +251,19 @@ fn watch_frame(app: AppHandle) {
         std::thread::sleep(std::time::Duration::from_millis(250));
         for (label, w) in app.webview_windows() {
             strip_frame(&w);
+            if app.state::<St>().hidden.lock().unwrap().contains(&label) {
+                let (w2, a2) = (w.clone(), app.clone());
+                let _ = w.run_on_main_thread(move || {
+                    use windows::Win32::{Foundation::{HWND, RECT}, Graphics::Gdi::{GetWindowRgnBox, NULLREGION}};
+                    let Ok(h) = w2.hwnd() else { return };
+                    let mut r = RECT::default();
+                    let t = unsafe { GetWindowRgnBox(HWND(h.0), &mut r) };
+                    if a2.state::<St>().hidden.lock().unwrap().contains(w2.label()) && t.0 != NULLREGION.0 {
+                        set_region(&w2, Some([0.0; 4]));
+                    }
+                });
+                continue;
+            }
             let want = app.state::<St>().clips.lock().unwrap().get(&label).copied();
             if let Some(want) = want {
                 let (w2, a2) = (w.clone(), app.clone());
@@ -417,10 +434,25 @@ fn set_screens(app: AppHandle, st: State<St>, mode: String) -> Result<(), String
     Ok(())
 }
 
+/// "Hide" = empty window region (nothing painted, no clicks); "show" = restore the clip region.
+/// tao's hide()/show() flashes white on a transparent WebView2 window, this keeps the WebView rendering.
+fn set_hidden(app: &AppHandle, w: &WebviewWindow, hide: bool) {
+    let st = app.state::<St>();
+    if hide {
+        st.hidden.lock().unwrap().insert(w.label().to_string());
+        set_region(w, Some([0.0; 4]));
+    } else {
+        st.hidden.lock().unwrap().remove(w.label());
+        let want = st.clips.lock().unwrap().get(w.label()).copied();
+        set_region(w, want);
+    }
+    strip_frame(w);
+}
+
 fn show_all(app: &AppHandle) {
     app.state::<St>().fs_hidden.lock().unwrap().clear();
     for w in app.webview_windows().values() {
-        let _ = w.show();
+        set_hidden(app, w, false);
     }
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.set_focus();
@@ -428,13 +460,11 @@ fn show_all(app: &AppHandle) {
 }
 
 fn toggle(app: &AppHandle) {
-    if app
-        .webview_windows()
-        .values()
-        .any(|w| w.is_visible().unwrap_or(false))
-    {
-        for w in app.webview_windows().values() {
-            let _ = w.hide();
+    let wins = app.webview_windows();
+    let hidden = app.state::<St>().hidden.lock().unwrap().clone();
+    if wins.keys().any(|l| !hidden.contains(l)) {
+        for w in wins.values() {
+            set_hidden(app, w, true);
         }
     } else {
         show_all(app);
@@ -442,10 +472,7 @@ fn toggle(app: &AppHandle) {
 }
 
 fn hotkey(app: &AppHandle) {
-    let hidden = app
-        .webview_windows()
-        .values()
-        .any(|w| !w.is_visible().unwrap_or(true));
+    let hidden = !app.state::<St>().hidden.lock().unwrap().is_empty();
     show_all(app);
     let _ = app.emit("hotkey", if hidden { "expand" } else { "toggle" });
 }
@@ -505,11 +532,12 @@ fn watch_fullscreen(app: AppHandle) {
             let idx = st.mon.lock().unwrap().get(label).copied().unwrap_or(0);
             let pos = ms.get(idx).map(|m| (m.position().x, m.position().y));
             let full = fs.is_some() && fs == pos;
-            if full && w.is_visible().unwrap_or(false) {
+            let user_hidden = st.hidden.lock().unwrap().contains(label);
+            if full && !user_hidden {
                 st.fs_hidden.lock().unwrap().insert(label.clone());
-                let _ = w.hide();
+                set_hidden(&app, w, true);
             } else if !full && st.fs_hidden.lock().unwrap().remove(label) {
-                let _ = w.show();
+                set_hidden(&app, w, false);
             }
         }
     });
@@ -1091,6 +1119,17 @@ fn main() {
                         ..
                     } = e
                     {
+                        // a tray double-click sends two Click{Up}: ignore the 2nd or the island blinks off/on
+                        static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+                        let dbl = Duration::from_millis(unsafe {
+                            windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime()
+                        } as u64);
+                        let mut last = LAST.lock().unwrap();
+                        if last.is_some_and(|l| l.elapsed() < dbl) {
+                            return;
+                        }
+                        *last = Some(Instant::now());
+                        drop(last);
                         toggle(t.app_handle());
                     }
                 })
