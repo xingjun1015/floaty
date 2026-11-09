@@ -35,6 +35,7 @@ struct St {
     mon: Mutex<HashMap<String, usize>>,
     shown: Mutex<HashSet<String>>,
     fs_hidden: Mutex<HashSet<String>>,
+    clips: Mutex<HashMap<String, [f64; 4]>>,
     hide_fs: AtomicBool,
     on_top: AtomicBool,
 }
@@ -47,6 +48,7 @@ impl Default for St {
             mon: Mutex::new(HashMap::new()),
             shown: Mutex::new(HashSet::new()),
             fs_hidden: Mutex::new(HashSet::new()),
+            clips: Mutex::new(HashMap::new()),
             hide_fs: AtomicBool::new(true),
             on_top: AtomicBool::new(true),
         }
@@ -162,7 +164,17 @@ fn fit(w: WebviewWindow, st: State<St>, width: f64, height: f64) {
 /// The window itself never resizes while the island morphs: a resized WebView2 shows stale, shifted
 /// or clipped frames for a moment, a region change does not.
 #[tauri::command]
-fn clip(w: WebviewWindow, rect: Option<[f64; 4]>) {
+fn clip(w: WebviewWindow, st: State<St>, rect: Option<[f64; 4]>) {
+    let mut m = st.clips.lock().unwrap();
+    match rect {
+        Some(r) => m.insert(w.label().to_string(), r),
+        None => m.remove(w.label()),
+    };
+    drop(m);
+    set_region(&w, rect);
+}
+
+fn set_region(w: &WebviewWindow, rect: Option<[f64; 4]>) {
     use windows::Win32::{
         Foundation::HWND,
         Graphics::Gdi::{CreateRectRgn, SetWindowRgn},
@@ -175,6 +187,24 @@ fn clip(w: WebviewWindow, rect: Option<[f64; 4]>) {
         });
         // the system owns the region after this call
         let _ = SetWindowRgn(HWND(h.0), rgn, true);
+    }
+}
+
+/// The region the UI asked for can go missing (hide/show, window restyling...) and the whole transparent
+/// canvas then swallows clicks meant for the desktop. Re-apply it whenever the real one differs.
+fn heal_region(w: &WebviewWindow, want: [f64; 4]) {
+    use windows::Win32::{
+        Foundation::{HWND, RECT},
+        Graphics::Gdi::GetWindowRgnBox,
+    };
+    let Ok(h) = w.hwnd() else { return };
+    let sf = w.scale_factor().unwrap_or(1.0);
+    let [x, y, rw, rh] = want;
+    let exp = ((x * sf).floor() as i32, (y * sf).floor() as i32, ((x + rw) * sf).ceil() as i32, ((y + rh) * sf).ceil() as i32);
+    let mut r = RECT::default();
+    let t = unsafe { GetWindowRgnBox(HWND(h.0), &mut r) };
+    if t.0 == 0 || (r.left, r.top, r.right, r.bottom) != exp {
+        set_region(w, Some(want));
     }
 }
 
@@ -215,8 +245,18 @@ fn strip_frame(w: &WebviewWindow) {
 fn watch_frame(app: AppHandle) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(250));
-        for w in app.webview_windows().values() {
-            strip_frame(w);
+        for (label, w) in app.webview_windows() {
+            strip_frame(&w);
+            let want = app.state::<St>().clips.lock().unwrap().get(&label).copied();
+            if let Some(want) = want {
+                let (w2, a2) = (w.clone(), app.clone());
+                // re-check on the main thread: the UI may have lifted the region meanwhile
+                let _ = w.run_on_main_thread(move || {
+                    if a2.state::<St>().clips.lock().unwrap().get(w2.label()) == Some(&want) {
+                        heal_region(&w2, want);
+                    }
+                });
+            }
         }
     });
 }

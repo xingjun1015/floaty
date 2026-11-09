@@ -121,15 +121,28 @@ const native = {
 // it settles, and is lifted before the island grows past it.
 const WIN_W = 520; // widest pill: MAX_PINS pins + "+N" + timer
 let seq = 0, islW = 0, islH = 0, clipT = 0, clipped = false;
-function unclip() { clearTimeout(clipT); if (!clipped) return null; clipped = false; return invoke("clip", { rect: null }).catch(() => {}); }
-function clipLater() {
-  clearTimeout(clipT);
-  clipT = setTimeout(() => {
-    const r = isl.getBoundingClientRect(), p = 6; // room for the shadow
-    clipped = true;
-    invoke("clip", { rect: [r.left - p, r.top - p, r.width + 2 * p, r.height + 2 * p] });
-  }, 750);
+let clipKey = "";
+function unclip() {
+  clearTimeout(clipT); clipT = setTimeout(applyClip, 750); clipKey = ""; // always re-clipped later
+  if (!clipped) return null;
+  clipped = false;
+  return invoke("clip", { rect: null }).catch(() => {});
 }
+const morphing = () => isl.getAnimations().some((a) => a instanceof CSSTransition);
+// measure the settled island and clip the window to it; never from a mid-transition frame, which would
+// leave a stale, oversized region that swallows clicks meant for the desktop
+function applyClip() {
+  if (morphing()) { clipT = setTimeout(applyClip, 100); return; }
+  clipT = 0;
+  const r = isl.getBoundingClientRect(), p = 6; // room for the shadow
+  const rect = [r.left - p, r.top - p, r.width + 2 * p, r.height + 2 * p], key = rect.join();
+  if (clipped && key === clipKey) return;
+  clipped = true; clipKey = key;
+  invoke("clip", { rect }).catch(() => { clipped = false; clipKey = ""; });
+}
+function clipLater() { clearTimeout(clipT); clipT = setTimeout(applyClip, 750); }
+// safety net: whatever happened, the region must always match the rendered island
+setInterval(() => { if (!clipT && cfg) applyClip(); }, 500);
 async function commit(fade) {
   if (!cfg) return;
   const my = ++seq;
