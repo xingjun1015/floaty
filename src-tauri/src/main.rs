@@ -568,9 +568,10 @@ fn launch(app: AppHandle, kind: String, path: String) -> Result<(), String> {
             .opener()
             .open_url(path, None::<&str>)
             .map_err(|e| e.to_string()),
+        // own visible console that stays open (/K), so the output of the command can be read
         "cmd" => Command::new("cmd")
-            .raw_arg(format!("/C {path}"))
-            .creation_flags(NO_WINDOW)
+            .raw_arg(format!("/K {path}"))
+            .creation_flags(0x0000_0010) // CREATE_NEW_CONSOLE
             .spawn()
             .map(|_| ())
             .map_err(|e| e.to_string()),
@@ -579,6 +580,182 @@ fn launch(app: AppHandle, kind: String, path: String) -> Result<(), String> {
             .open_path(path, None::<&str>)
             .map_err(|e| e.to_string()),
     }
+}
+
+/// (hwnd, class, title) of every visible top-level window.
+fn top_windows() -> Vec<(isize, String, String)> {
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM},
+        UI::WindowsAndMessaging::{EnumWindows, GetClassNameW, GetWindowTextW, IsWindowVisible},
+    };
+    unsafe extern "system" fn cb(h: HWND, l: LPARAM) -> windows::core::BOOL {
+        let out = &mut *(l.0 as *mut Vec<(isize, String, String)>);
+        if IsWindowVisible(h).as_bool() {
+            let (mut c, mut t) = ([0u16; 64], [0u16; 512]);
+            let (cn, tn) = (GetClassNameW(h, &mut c), GetWindowTextW(h, &mut t));
+            if tn > 0 {
+                out.push((h.0 as isize, String::from_utf16_lossy(&c[..cn as usize]), String::from_utf16_lossy(&t[..tn as usize])));
+            }
+        }
+        windows::core::BOOL(1)
+    }
+    let mut v: Vec<(isize, String, String)> = vec![];
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut v as *mut _ as isize));
+    }
+    v
+}
+
+const BROWSER_CLASSES: [&str; 2] = ["Chrome_WidgetWin_1", "MozillaWindowClass"];
+const BROWSER_NAMES: [&str; 6] = ["chrome", "edge", "firefox", "brave", "opera", "vivaldi"];
+
+/// Page title of the browser window in front, without the " - Google Chrome" suffix.
+#[tauri::command(async)]
+fn browser_title() -> Option<String> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let fg = unsafe { GetForegroundWindow() }.0 as isize;
+    let (_, class, title) = top_windows().into_iter().find(|w| w.0 == fg)?;
+    let cut = title.rfind(" - ").or_else(|| title.rfind(" \u{2014} "))?;
+    let (page, browser) = (&title[..cut], title[cut..].to_lowercase());
+    // drop a leading unread counter such as "(465) ": it changes all the time
+    let page = match page.strip_prefix('(').and_then(|r| r.split_once(") ")) {
+        Some((n, rest)) if n.chars().all(|c| c.is_ascii_digit()) => rest,
+        _ => page,
+    };
+    (BROWSER_CLASSES.contains(&class.as_str()) && BROWSER_NAMES.iter().any(|b| browser.contains(b)) && !page.is_empty())
+        .then(|| page.to_string())
+}
+
+// ---- browser tabs (UI Automation: browsers expose their tab strip as TabItem elements)
+use windows::Win32::UI::Accessibility::{IUIAutomation, IUIAutomationElement};
+
+/// A UIA element stays valid for as long as its tab exists, also while the tab navigates to other pages.
+struct TabEl(IUIAutomationElement);
+// SAFETY: UIA proxies are free-threaded and COM is initialised as MTA on every thread that uses them
+unsafe impl Send for TabEl {}
+/// Floaty item id -> (top-level browser window, its tab)
+static TABS: std::sync::LazyLock<Mutex<HashMap<String, (isize, TabEl)>>> = std::sync::LazyLock::new(Default::default);
+
+fn uia() -> Option<IUIAutomation> {
+    use windows::Win32::{
+        System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED},
+        UI::Accessibility::CUIAutomation,
+    };
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()
+    }
+}
+
+/// All tab elements of one browser window.
+fn tabs_of(ua: &IUIAutomation, hwnd: isize) -> Vec<IUIAutomationElement> {
+    use windows::Win32::{
+        Foundation::HWND,
+        System::Variant::VARIANT,
+        UI::Accessibility::{TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_TabItemControlTypeId},
+    };
+    unsafe {
+        let Ok(cond) = ua.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_TabItemControlTypeId.0)) else {
+            return vec![];
+        };
+        let Ok(root) = ua.ElementFromHandle(HWND(hwnd as *mut _)) else { return vec![] };
+        let Ok(arr) = root.FindAll(TreeScope_Descendants, &cond) else { return vec![] };
+        (0..arr.Length().unwrap_or(0)).filter_map(|i| arr.GetElement(i).ok()).collect()
+    }
+}
+
+fn tab_name(t: &IUIAutomationElement) -> Option<String> {
+    // Chrome and Edge append " - Memory usage - 94.9 MB" to the name of a tab
+    unsafe { t.CurrentName().ok().map(|n| n.to_string().split(" - Memory usage").next().unwrap_or_default().to_string()) }
+}
+
+/// Select the tab and raise its window. False if the tab is gone.
+fn show_tab(hwnd: isize, tab: &IUIAutomationElement) -> bool {
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::{
+            Accessibility::{IUIAutomationSelectionItemPattern, UIA_SelectionItemPatternId},
+            WindowsAndMessaging::{IsIconic, IsWindow, SetForegroundWindow, ShowWindow, SW_RESTORE},
+        },
+    };
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        if !IsWindow(Some(h)).as_bool() || tab_name(tab).is_none() {
+            return false;
+        }
+        let Ok(sel) = tab.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId) else {
+            return false;
+        };
+        if sel.Select().is_err() {
+            return false;
+        }
+        if IsIconic(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(h);
+        true
+    }
+}
+
+/// Jump to the tab that belongs to this item: first the exact tab we remembered (it survives navigating to other
+/// pages), else any tab whose title contains `title` (after a Floaty restart). Returns the tab's current title.
+#[tauri::command(async)]
+fn focus_tab(id: String, title: String) -> Option<String> {
+    let ua = uia()?;
+    let known = TABS.lock().unwrap().remove(&id);
+    if let Some((h, TabEl(t))) = known {
+        if show_tab(h, &t) {
+            let name = tab_name(&t);
+            TABS.lock().unwrap().insert(id, (h, TabEl(t)));
+            return name;
+        }
+    }
+    let want = title.to_lowercase();
+    if want.is_empty() {
+        return None;
+    }
+    for (h, class, _) in top_windows() {
+        if !BROWSER_CLASSES.contains(&class.as_str()) {
+            continue;
+        }
+        for t in tabs_of(&ua, h) {
+            let name = tab_name(&t).unwrap_or_default();
+            if name.to_lowercase().contains(&want) && show_tab(h, &t) {
+                TABS.lock().unwrap().insert(id, (h, TabEl(t)));
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// Remember the selected tab of the browser window in front as this item's tab. Returns its title.
+#[tauri::command(async)]
+fn learn_tab(id: String) -> Option<String> {
+    use windows::Win32::UI::{
+        Accessibility::{IUIAutomationSelectionItemPattern, UIA_SelectionItemPatternId},
+        WindowsAndMessaging::GetForegroundWindow,
+    };
+    let ua = uia()?;
+    let fg = unsafe { GetForegroundWindow() }.0 as isize;
+    let (_, class, _) = top_windows().into_iter().find(|w| w.0 == fg)?;
+    if !BROWSER_CLASSES.contains(&class.as_str()) {
+        return None;
+    }
+    for t in tabs_of(&ua, fg) {
+        let selected = unsafe {
+            t.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
+                .and_then(|p| p.CurrentIsSelected())
+                .map(|b| b.as_bool())
+                .unwrap_or(false)
+        };
+        if selected {
+            let name = tab_name(&t)?;
+            TABS.lock().unwrap().insert(id, (fg, TabEl(t)));
+            return Some(name);
+        }
+    }
+    None
 }
 
 #[tauri::command(async)]
@@ -643,6 +820,7 @@ fn running_exes() -> Vec<String> {
 struct Entry {
     name: String,
     path: String,
+    store: bool,
 }
 
 fn walk(dir: &Path, depth: u8, out: &mut Vec<Entry>) {
@@ -663,6 +841,7 @@ fn walk(dir: &Path, depth: u8, out: &mut Vec<Entry>) {
                 out.push(Entry {
                     name,
                     path: p.to_string_lossy().into_owned(),
+                    store: false,
                 });
             }
         }
@@ -679,6 +858,20 @@ fn start_menu() -> Vec<Entry> {
                 0,
                 &mut v,
             );
+        }
+    }
+    // Store (UWP) apps have no .lnk: ask Windows for the Start apps and keep the packaged ones (AppID contains "!")
+    if let Ok(o) = Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Get-StartApps | ForEach-Object { $_.Name + [char]9 + $_.AppID }"])
+        .creation_flags(NO_WINDOW)
+        .output()
+    {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            if let Some((name, id)) = line.split_once('\t') {
+                if id.contains('!') && !name.trim().is_empty() {
+                    v.push(Entry { name: name.trim().to_string(), path: format!("shell:AppsFolder\\{}", id.trim()), store: true });
+                }
+            }
         }
     }
     v.sort_by_key(|e| e.name.to_lowercase());
@@ -821,6 +1014,9 @@ fn main() {
             run_admin,
             reveal,
             running_exes,
+            browser_title,
+            focus_tab,
+            learn_tab,
             start_menu,
             read_clipboard,
             media_info,

@@ -193,7 +193,24 @@ function open(it) {
   if (editing) return go("item:" + it.id);
   if (it.kind === "group") return go("group:" + it.id);
   if (it.kind === "snippet") { navigator.clipboard.writeText(it.path).catch(() => {}); return flash("Copied " + it.name); }
+  if (it.kind === "url") return openUrl(it);
   invoke("launch", { kind: it.kind, path: it.path }).catch((e) => flash(String(e).slice(0, 30)));
+}
+// URLs: jump back to the exact browser tab we opened for this item (also after navigating to other pages), otherwise
+// open the link and remember the tab. The native side keeps the tab itself; the title is only a fallback after a restart.
+async function openUrl(it) {
+  const cur = await invoke("focus_tab", { id: it.id, title: it.tab || "" }).catch(() => null);
+  if (cur != null) {
+    if (it.tabAuto && cur !== it.tab) { it.tab = cur; save(); }
+    return;
+  }
+  await invoke("launch", { kind: "url", path: it.path }).catch((e) => flash(String(e).slice(0, 30)));
+  // the new tab is in front once the browser has opened it; retry while it is still loading
+  for (let i = 0; i < 8; i++) {
+    await new Promise((r) => setTimeout(r, 1500));
+    const t = await invoke("learn_tab", { id: it.id }).catch(() => null);
+    if (t) { it.tab = t; it.tabAuto = true; save(); return; }
+  }
 }
 function openFromPill(it, el) {
   if (it.kind === "group") { S().collapsed = false; view = "group:" + it.id; stack = ["quick"]; save(); commit(true); return; }
@@ -396,11 +413,12 @@ function vGroup(id) {
 function vAdd() {
   const f = {};
   const field = (k, ph) => (f[k] = h("input", { class: "fld", placeholder: ph }));
+  // build only the active form: field() stores its input in f, so building all of them made f.val point at the snippet textarea
   const forms = {
-    url: [field("name", "Name (optional)"), field("val", "https://example.com")],
-    cmd: [field("name", "Name"), field("val", "Command, e.g. code C:\\work")],
-    snippet: [field("name", "Name"), (f.val = h("textarea", { class: "fld", rows: 3, placeholder: "Text to copy on click" }))],
-    group: [field("name", "Group name")],
+    url: () => [field("name", "Name (optional)"), field("val", "https://example.com")],
+    cmd: () => [field("name", "Name"), field("val", "Command, e.g. code C:\work")],
+    snippet: () => [field("name", "Name"), (f.val = h("textarea", { class: "fld", rows: 3, placeholder: "Text to copy on click" }))],
+    group: () => [field("name", "Group name")],
   };
   const target = addTo && addTo !== "top" ? (findItem(addTo) || {}).it : null;
   const make = () => {
@@ -414,29 +432,37 @@ function vAdd() {
     hdr([backBtn(), h("span", { class: "ttl" }, target ? "Add to " + target.name : "Add")]),
     h("div", { class: "tabs" }, [["url", "URL"], ["cmd", "Command"], ["snippet", "Snippet"], ["group", "Group"]].map(([k, t]) =>
       h("button", { class: "btn" + (addKind === k ? " on" : ""), onclick: () => { addKind = k; commit(false); } }, t))),
-    h("div", { class: "stack" }, ...forms[addKind], h("button", { class: "btn pri", onclick: () => { make(); back(); } }, "Add")),
+    h("div", { class: "stack" }, ...forms[addKind](), h("button", { class: "btn pri", onclick: () => { make(); back(); } }, "Add")),
     h("p", { class: "muted", style: "margin-top:12px" }, "Tip: drop files, folders or apps onto the island."),
     h("div", { class: "btns" }, h("button", { class: "btn", onclick: openStart }, "Import from Start Menu")),
   ];
 }
-async function openStart() { go("start"); if (!sm) { sm = await invoke("start_menu"); if (view === "start") fillStart(); } }
+async function openStart() { go("start"); if (!sm) { sm = await invoke("start_menu").catch(() => []); if (view === "start") fillStart(); } }
 let startList = null, startHave = null;
+const startKey = (e) => e.path.toLowerCase();
 function fillStart() {
   const q = smQ.toLowerCase();
-  startList.replaceChildren(...(sm || []).filter((e) => e.name.toLowerCase().includes(q)).slice(0, 150).map((e) =>
-    h("div", { class: "li" + (startHave.has(e.path) ? " done" : ""), onclick: async (ev) => {
-      if (startHave.has(e.path)) return;
-      startHave.add(e.path); ev.currentTarget.classList.add("done"); ev.currentTarget.prepend("\u2713 ");
-      await addPaths([e.path]);
-    } }, (startHave.has(e.path) ? "\u2713 " : "") + e.name)));
-  if (!sm) startList.append(h("div", { class: "muted" }, "Loading..."));
-  if (cur && cur.contains(startList)) relayout();
+  const rows = (sm || []).filter((e) => e.name.toLowerCase().includes(q));
+  startList.replaceChildren(...rows.map((e) => {
+    const done = startHave.has(startKey(e));
+    return h("div", { class: "li" + (done ? " done" : ""), title: e.name, onclick: async (ev) => {
+      const el = ev.currentTarget;
+      if (startHave.has(startKey(e))) return;
+      startHave.add(startKey(e)); el.classList.add("done");
+      // Store apps have no file to classify: they open through shell:AppsFolder
+      if (e.path.startsWith("shell:")) { addItem({ kind: "app", name: e.name, path: e.path }); flash("Saved " + e.name); }
+      else await addPaths([e.path]);
+    } }, e.name, e.store && h("span", { class: "src" }, "Store"));
+  }));
+  if (!sm) startList.append(h("div", { class: "muted" }, "Loading apps..."));
+  else if (!rows.length) startList.append(h("div", { class: "muted" }, "No apps match"));
 }
 function vStart() {
-  startHave = new Set(flat(prof().items).map((i) => i.path));
-  startList = h("div", { class: "list" });
-  const input = h("input", { class: "fld", placeholder: "Filter apps...", value: smQ, oninput: (e) => { smQ = e.target.value; fillStart(); } });
+  startHave = new Set(flat(prof().items).map((i) => (i.path || "").toLowerCase()));
+  startList = h("div", { class: "list tall" });
+  const input = h("input", { class: "fld", placeholder: "Search apps...", value: smQ, oninput: (e) => { smQ = e.target.value; fillStart(); } });
   fillStart();
+  setTimeout(() => input.focus(), 350);
   return [hdr([backBtn(), h("span", { class: "ttl" }, "Start Menu")]), input, startList];
 }
 
@@ -516,6 +542,9 @@ function vItem(id) {
     h("div", { class: "scroll" },
       h("div", { class: "irow" }, prev, h("input", { class: "fld", value: it.name, onchange: (e) => { it.name = e.target.value || it.name; save(); } })),
       it.path && h("div", { class: "path" }, it.path),
+      it.kind === "url" && h("div", { class: "rw col" },
+        h("div", { class: "rl" }, h("div", {}, "Browser tab title"), h("div", { class: "sub" }, "Clicking jumps to the tab Floaty opened (it follows the tab when you navigate). The title is only used to find it again after a restart")),
+        h("input", { class: "fld", placeholder: "Learned automatically after the first open", value: it.tab || "", onchange: (e) => { it.tab = e.target.value.trim(); delete it.tabAuto; if (!it.tab) delete it.tab; save(); } })),
       h("div", { class: "btns" },
         it.kind !== "group" && btn("Open", () => { const e = editing; editing = false; open(it); editing = e; }),
         btn(it.pinned ? "Unpin from bar" : "Pin to bar", () => { it.pinned = !it.pinned; save(); commit(false); }),

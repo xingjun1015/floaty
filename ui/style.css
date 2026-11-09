@@ -161,6 +161,13 @@ select.fld option { background: #222; color: #eee; }
 .list .li { padding: 7px 9px; border-radius: 9px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .list .li:hover { background: rgba(var(--line), .12); }
 .list .li.done { color: var(--sub); }
+.list::-webkit-scrollbar { width: 4px; }
+.list::-webkit-scrollbar-thumb { background: rgba(var(--line), .25); border-radius: 2px; }
+/* fixed height so the island does not have to resize when the list fills in or is filtered */
+.list.tall { height: 270px; display: flex; flex-direction: column; }
+.list.tall .li { flex: none; }
+.list .li .src { float: right; margin-left: 8px; font-size: 11px; color: var(--sub); }
+.list .li.done::before { content: "\2713"; margin-right: 6px; }
 .muted { color: var(--sub); }
 .path { color: var(--sub); margin: 8px 0 0; word-break: break-all; user-select: text; -webkit-user-select: text; font-size: 12px; }
 
