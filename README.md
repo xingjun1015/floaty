@@ -4,6 +4,8 @@ A lightweight, Mac-style floating island for the Windows desktop. It sits on you
 
 Built with Rust + [Tauri 2](https://tauri.app) (WebView2) and a tiny vanilla JS/CSS UI. No bundler, no framework. The release exe is about 3.7 MB.
 
+![Floaty demo: collapsed pill, expanded card, edit mode and the add screen](docs/demo.gif)
+
 ## Features
 
 **Island**
