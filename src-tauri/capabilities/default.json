@@ -1,5 +1,10 @@
 {
   "identifier": "default",
-  "windows": ["main", "m*"],
-  "permissions": ["core:default", "dialog:default"]
+  "windows": ["main", "m*", "todo"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-size"
+  ]
 }

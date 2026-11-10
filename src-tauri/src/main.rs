@@ -26,6 +26,9 @@ use tauri_plugin_opener::OpenerExt;
 const NO_WINDOW: u32 = 0x0800_0000;
 // the UI pads the island by 10px; this keeps the island about 12px from the screen edge
 const MARGIN: f64 = 2.0;
+// Label of the todo pop-out. It is NOT an island: it must be skipped by every loop that docks, re-sizes,
+// destroys or pins "all windows" (place_all, set_on_top, set_screens) and uses its own monitor (watch_fullscreen).
+const TODO: &str = "todo";
 
 // ---------------------------------------------------------------- state
 
@@ -142,7 +145,9 @@ fn place(w: &WebviewWindow, st: &St) {
 fn place_all(app: &AppHandle) {
     let st = app.state::<St>();
     for w in app.webview_windows().values() {
-        place(w, &st);
+        if w.label() != TODO {
+            place(w, &st);
+        }
     }
 }
 
@@ -339,7 +344,9 @@ fn set_dock(app: AppHandle, st: State<St>, dock: String) {
 fn set_on_top(app: AppHandle, st: State<St>, on: bool) {
     st.on_top.store(on, Relaxed);
     for w in app.webview_windows().values() {
-        let _ = w.set_always_on_top(on);
+        if w.label() != TODO {
+            let _ = w.set_always_on_top(on);
+        }
     }
 }
 
@@ -402,7 +409,7 @@ fn set_screens(app: AppHandle, st: State<St>, mode: String) -> Result<(), String
         }
     }
     for (l, w) in app.webview_windows() {
-        if l != "main" && !want.iter().any(|&i| label(i) == l) {
+        if l != "main" && l != TODO && !want.iter().any(|&i| label(i) == l) {
             st.shown.lock().unwrap().remove(&l);
             let _ = w.destroy();
         }
@@ -477,6 +484,77 @@ fn hotkey(app: &AppHandle) {
     let _ = app.emit("hotkey", if hidden { "expand" } else { "toggle" });
 }
 
+// ---------------------------------------------------------------- todo pop-out
+
+#[derive(serde::Deserialize)]
+struct Geo {
+    x: Option<i32>,
+    y: Option<i32>,
+    w: f64,
+    h: f64,
+    top: bool,
+}
+
+/// Open (or focus) / close the todo pop-out. async: building windows from a sync command deadlocks on Windows.
+#[tauri::command(async)]
+fn todo_window(app: AppHandle, open: bool, geo: Option<Geo>) -> Result<(), String> {
+    let st = app.state::<St>();
+    if !open {
+        st.hidden.lock().unwrap().remove(TODO);
+        st.fs_hidden.lock().unwrap().remove(TODO);
+        if let Some(w) = app.get_webview_window(TODO) {
+            let _ = w.destroy();
+        }
+        return Ok(());
+    }
+    if let Some(w) = app.get_webview_window(TODO) {
+        set_hidden(&app, &w, false);
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    let g = geo.unwrap_or(Geo { x: None, y: None, w: 340.0, h: 480.0, top: true });
+    let w = tauri::WebviewWindowBuilder::new(&app, TODO, tauri::WebviewUrl::App("todo.html".into()))
+        .title("Floaty Todo")
+        .inner_size(g.w.max(280.0), g.h.max(240.0))
+        .min_inner_size(280.0, 240.0)
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .skip_taskbar(true)
+        .resizable(true)
+        .always_on_top(g.top)
+        .visible(false)
+        .center()
+        .build()
+        .map_err(|e| e.to_string())?;
+    // restore the last position, unless that spot is no longer on any screen
+    if let (Some(x), Some(y)) = (g.x, g.y) {
+        let on = app.available_monitors().unwrap_or_default().iter().any(|m| {
+            let (p, s) = (m.position(), m.size());
+            x >= p.x && y >= p.y && x < p.x + s.width as i32 - 40 && y < p.y + s.height as i32 - 40
+        });
+        if on {
+            let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+        }
+    }
+    Ok(())
+}
+
+/// The pop-out's own "keep on top" pin. tao rewrites the window styles here, so strip the frame bits again.
+#[tauri::command]
+fn todo_top(w: WebviewWindow, on: bool) {
+    let _ = w.set_always_on_top(on);
+    strip_frame(&w);
+}
+
+/// Called by the pop-out after its first render, so it never shows a blank white frame.
+#[tauri::command]
+fn todo_ready(w: WebviewWindow) {
+    guard_frame(&w);
+    strip_frame(&w);
+    let _ = w.show();
+}
+
 // ---------------------------------------------------------------- fullscreen watcher
 
 /// Top-left of the monitor hosting a fullscreen foreground window that is not ours.
@@ -530,7 +608,11 @@ fn watch_fullscreen(app: AppHandle) {
         let ms = mons(&app);
         for (label, w) in &wins {
             let idx = st.mon.lock().unwrap().get(label).copied().unwrap_or(0);
-            let pos = ms.get(idx).map(|m| (m.position().x, m.position().y));
+            let pos = if label == TODO {
+                w.current_monitor().ok().flatten().map(|m| (m.position().x, m.position().y))
+            } else {
+                ms.get(idx).map(|m| (m.position().x, m.position().y))
+            };
             let full = fs.is_some() && fs == pos;
             let user_hidden = st.hidden.lock().unwrap().contains(label);
             if full && !user_hidden {
@@ -1059,10 +1141,33 @@ fn media_ctl(op: String) {
 
 // ---------------------------------------------------------------- config
 
-fn cfg_path(app: &AppHandle) -> Result<PathBuf, String> {
+/// Debug builds can redirect all data files with FLOATY_DATA_DIR so tests never touch the real config.
+fn data_path(app: &AppHandle, file: &str) -> Result<PathBuf, String> {
+    #[cfg(debug_assertions)]
+    if let Some(d) = std::env::var_os("FLOATY_DATA_DIR") {
+        let d = PathBuf::from(d);
+        fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+        return Ok(d.join(file));
+    }
     let d = app.path().app_config_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-    Ok(d.join("config.json"))
+    Ok(d.join(file))
+}
+
+fn cfg_path(app: &AppHandle) -> Result<PathBuf, String> {
+    data_path(app, "config.json")
+}
+
+/// Atomic write (tmp + rename), then tell the other windows (event payload { from, text }).
+fn write_shared(app: &AppHandle, w: &WebviewWindow, file: &str, event: &str, text: String) -> Result<(), String> {
+    let p = data_path(app, file)?;
+    let tmp = p.with_extension("tmp");
+    fs::write(&tmp, &text).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
+    if app.webview_windows().len() > 1 {
+        let _ = app.emit(event, serde_json::json!({ "from": w.label(), "text": text }));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1072,17 +1177,29 @@ fn load_config(app: AppHandle) -> Option<String> {
 
 #[tauri::command]
 fn save_config(app: AppHandle, w: WebviewWindow, text: String) -> Result<(), String> {
-    let p = cfg_path(&app)?;
-    let tmp = p.with_extension("tmp");
-    fs::write(&tmp, &text).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
-    if app.webview_windows().len() > 1 {
-        let _ = app.emit(
-            "cfg",
-            serde_json::json!({ "from": w.label(), "text": text }),
-        );
-    }
-    Ok(())
+    write_shared(&app, &w, "config.json", "cfg", text)
+}
+
+// todos live in their own file: tasks pile up, and every window saves them on each edit
+#[tauri::command]
+fn load_todos(app: AppHandle) -> Option<String> {
+    fs::read_to_string(data_path(&app, "todos.json").ok()?).ok()
+}
+
+#[tauri::command]
+fn save_todos(app: AppHandle, w: WebviewWindow, text: String) -> Result<(), String> {
+    write_shared(&app, &w, "todos.json", "todos", text)
+}
+
+/// Writes the given export text (JS builds it) to a path picked in the save dialog.
+#[tauri::command]
+fn export_todos(dest: String, text: String) -> Result<(), String> {
+    fs::write(dest, text).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn import_todos(src: String) -> Result<String, String> {
+    fs::read_to_string(src).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1152,7 +1269,14 @@ fn main() {
             load_config,
             save_config,
             export_config,
-            import_config
+            import_config,
+            load_todos,
+            save_todos,
+            export_todos,
+            import_todos,
+            todo_window,
+            todo_top,
+            todo_ready
         ])
         .setup(|app| {
             let menu = Menu::with_items(

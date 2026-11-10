@@ -9,7 +9,7 @@ const MAX_PINS = 8;
 const DEFAULTS = {
   dock: "b", screen: "0", opacity: 85, theme: "glass", accent: "#0a84ff", sysAccent: false, maxRows: 3,
   onTop: true, outside: true, autostart: false, autohide: false, hideFs: true, collapsed: false,
-  widgets: { clock: true, battery: false, media: false, clip: false, timer: true },
+  widgets: { clock: true, battery: false, media: false, clip: false, timer: true, todo: false },
 };
 const ANCHOR = { tl: ["l", "t"], t: ["c", "t"], tr: ["r", "t"], l: ["l", "m"], r: ["r", "m"], bl: ["l", "b"], b: ["c", "b"], br: ["r", "b"] };
 const DOCK_NAME = { tl: "Top left", t: "Top", tr: "Top right", l: "Left", r: "Right", bl: "Bottom left", b: "Bottom", br: "Bottom right" };
@@ -21,6 +21,9 @@ const ICON_CHOICES = ["folder", "file", "file-text", "photo", "app-window", "lin
 let cfg, view = "quick", stack = [], query = "", editing = false, addKind = "url", addTo = null;
 let sm = null, smQ = "", msg = "", msgT = 0, clips = [], media = null, running = new Set(), batt = null, monList = [];
 let reordering = false, hideTimer = 0, tick = 0, dialogOpen = false;
+// todo module (off unless widgets.todo): the document lives in todos.json, see todoLoad()
+let todo = null, todoRoot = null, todoDay = "", todoImp = null, todoBox = null;
+const tdUi = { addDate: null, sel: null, month: null };
 const tm = { total: 300, left: 300, running: false, end: 0, ring: false };
 
 const $ = (id) => document.getElementById(id);
@@ -28,26 +31,7 @@ const isl = $("isl"), inn = $("in"), meas = $("meas");
 let cur = null, curW = 0, swapT = 0, gridHold = null;
 
 // ------------------------------------------------------------ helpers
-function h(tag, a = {}, ...kids) {
-  const e = document.createElement(tag);
-  for (const [k, v] of Object.entries(a)) {
-    if (v == null || v === false) continue;
-    if (k === "class") e.className = v;
-    else if (k === "style") e.style.cssText = v;
-    else if (k === "value" || k === "checked") e[k] = v;
-    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
-    else e.setAttribute(k, v === true ? "" : v);
-  }
-  for (const c of kids.flat()) if (c != null && c !== false) e.append(c.nodeType ? c : document.createTextNode(c));
-  return e;
-}
-function ic(name, size = 18) {
-  const s = document.createElement("span");
-  s.className = "ic";
-  // ICONS holds static, bundled SVG markup (icons.js), never user input
-  s.innerHTML = `<svg class="i" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${(window.ICONS || {})[name] || ""}</svg>`;
-  return s;
-}
+const { h, ic, Todo, TodoUI } = window, paintLook = window.paint;
 const uid = () => crypto.randomUUID();
 const ext = (p) => (p.split(".").pop() || "").toLowerCase();
 const prof = () => cfg.profiles.find((p) => p.id === cfg.active) || cfg.profiles[0];
@@ -99,10 +83,8 @@ const isTyping = () => ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeE
 
 // ------------------------------------------------------------ look + native
 function applyLook() {
-  const s = S(), r = document.documentElement.style;
-  r.setProperty("--a", s.opacity / 100);
-  r.setProperty("--accent", s.sysAccent ? "AccentColor" : s.accent);
-  document.body.className = `t-${s.theme}`;
+  const s = S();
+  paintLook(s);
   const [ah, av] = ANCHOR[s.dock];
   if (isl.dataset.h !== ah || isl.dataset.v !== av) { unclip(); clipLater(); } // the island moves inside the window
   [isl.dataset.h, isl.dataset.v] = [ah, av];
@@ -184,6 +166,7 @@ function softRefresh() {
 // ------------------------------------------------------------ navigation
 function valid(v) {
   const [k, id] = v.split(":");
+  if (k === "todo" || k === "plan") return !!(S().widgets.todo && todo);
   return !["item", "group"].includes(k) || !!findItem(id);
 }
 function go(v, to) { stack.push(view); view = v; if (to !== undefined) addTo = to; commit(true); }
@@ -319,6 +302,7 @@ function strip() {
   if (w.battery && batt) out.push(h("div", { class: "chip" }, ic("bolt", 15), h("span", { "data-t": "batt" }, battText())));
   if (w.media) out.push(h("div", { class: "chip click", onclick: () => go("media") }, media && media.active ? [bars(media.playing), h("span", { class: "t" }, media.title)] : [ic("music", 15), h("span", { class: "t" }, "Nothing playing")]));
   if (w.timer) out.push(h("div", { class: "chip click tmr", onclick: () => go("timer") }, ic("hourglass", 15), h("span", { "data-t": "timer" }, fmt(timerLeft()))));
+  if (w.todo && todo) out.push(h("div", { class: "chip click", onclick: () => go("todo") }, ic("checkbox", 15), h("span", {}, todoText())));
   if (w.clip) out.push(h("div", { class: "chip click", onclick: () => go("clip") }, ic("clipboard", 15), h("span", {}, clips.length + " copied")));
   return out.length ? h("div", { class: "strip" }, out) : null;
 }
@@ -373,6 +357,7 @@ function timerTick() {
 function globalTick() {
   tick++;
   timerTick(); updLive();
+  if (todo && Todo.localISO(new Date()) !== todoDay) { todoDay = Todo.localISO(new Date()); todoChanged(); }
   if (S().widgets.clip && tick % 2 === 0) pollClip();
   if (S().widgets.media && tick % 3 === 0) pollMedia();
   if ((!S().collapsed || prof().items.some((i) => i.pinned && i.exe)) && tick % 4 === 0) pollRunning();
@@ -396,6 +381,7 @@ function buildCompact() {
       return el;
     }),
     more > 0 && h("span", { class: "more" }, "+" + more),
+    w.todo && todo && (todoOpen() > 0 || S().todoPin) && h("span", { class: "tdc", title: "Todo: open today", onclick: (e) => { e.stopPropagation(); S().collapsed = false; view = "todo"; stack = ["quick"]; save(); commit(true); } }, ic("checkbox", 15), todoOpen() || null),
     right && h("span", { class: "cr" }, right));
 }
 
@@ -403,7 +389,7 @@ function buildCompact() {
 function buildView() {
   if (!valid(view)) view = "quick";
   const [kind, id] = view.split(":");
-  const fn = { quick: vQuick, settings: vSettings, add: vAdd, start: vStart, clip: vClip, media: vMedia, timer: vTimer, item: () => vItem(id), group: () => vGroup(id) }[kind] || vQuick;
+  const fn = { quick: vQuick, settings: vSettings, add: vAdd, start: vStart, clip: vClip, media: vMedia, timer: vTimer, todo: vTodo, plan: vPlan, item: () => vItem(id), group: () => vGroup(id) }[kind] || vQuick;
   return h("div", { class: "view" }, fn());
 }
 const hdr = (left, ...right) => h("div", { class: "hdr" }, h("div", { class: "l" }, left), h("div", { class: "r" }, ...right));
@@ -590,6 +576,84 @@ function vItem(id) {
   ];
 }
 
+// ------------------------------------------------------------ todo + plan
+const todoOpen = () => Todo.byDate(todo.tasks, Todo.localISO(new Date())).filter((t) => !t.done).length;
+function todoText() {
+  const all = Todo.byDate(todo.tasks, Todo.localISO(new Date())).length, n = todoOpen();
+  return n ? n + " to do" : all ? "All done" : "No tasks";
+}
+async function todoLoad() {
+  if (todo) return;
+  try { todo = Todo.normalize(JSON.parse(await invoke("load_todos"))); } catch (_) { todo = Todo.normalize(null); }
+  todoDay = Todo.localISO(new Date());
+}
+const todoSave = () => invoke("save_todos", { text: JSON.stringify(todo) }).catch(() => {});
+// tasks changed somewhere (another window, midnight): redraw what shows them
+function todoChanged() {
+  if (!todo || S().collapsed) return softRefresh();
+  if ((view === "todo" || view === "plan") && todoRoot) { todoRoot.refresh(); relayout(); } else softRefresh();
+}
+const todoCtx = () => ({ get: () => todo.tasks, set: (n) => { todo.tasks = n; todoSave(); }, ui: tdUi, after: relayout });
+async function popOut() {
+  todo.win.open = true;
+  await todoSave(); // the new window loads what is on disk
+  invoke("todo_window", { open: true, geo: todo.win }).catch((e) => flash(String(e).slice(0, 30)));
+}
+async function todoOff() {
+  if (todo && todo.win.open) { todo.win.open = false; await todoSave(); }
+  invoke("todo_window", { open: false }).catch(() => {});
+  todo = null; todoRoot = null; todoImp = null;
+  if (["todo", "plan"].includes(view)) { view = "quick"; stack = []; }
+}
+const popBtn = () => h("button", { class: "ibtn", title: "Open in its own window", onclick: popOut }, ic("external-link", 16));
+function vTodo() {
+  todoRoot = TodoUI.days(todoCtx());
+  const pinned = !!S().todoPin;
+  return [hdr([backBtn(), h("span", { class: "ttl" }, "Todo")],
+    h("button", { class: "ibtn" + (pinned ? " on" : ""), title: pinned ? "Unpin from bar" : "Pin to bar (always show when collapsed)", onclick: () => { S().todoPin = !pinned; save(); commit(false); } }, ic("pin", 16)),
+    h("button", { class: "ibtn", title: "Month plan", onclick: () => go("plan") }, ic("calendar", 17)), popBtn()), todoRoot];
+}
+function vPlan() {
+  todoRoot = TodoUI.plan(todoCtx());
+  return [hdr([backBtn(), h("span", { class: "ttl" }, "Plan")], popBtn()), todoRoot];
+}
+// settings: export / import rows (filled live so toggling the module needs no rebuild of the page)
+function fillTodoData() {
+  if (!todoBox) return;
+  const btn = (t, fn, cls = "") => h("button", { class: "btn " + cls, onclick: fn }, t);
+  const rows = [];
+  if (S().widgets.todo && todo) {
+    rows.push(h("div", { class: "rw" }, btn("Export tasks", exportTodos), btn("Import tasks", importTodos)));
+    if (todoImp) {
+      rows.push(h("div", { class: "rw col" },
+        h("div", { class: "rl" }, h("div", {}, todoImp.tasks.length + " valid" + (todoImp.skipped ? ", " + todoImp.skipped + " skipped" : "")), h("div", { class: "sub" }, "Merge keeps your tasks and updates matching ones; replace discards the current list")),
+        h("div", { class: "btns", style: "margin-top:0" },
+          btn("Merge", () => { todo.tasks = Todo.mergeTasks(todo.tasks, todoImp.tasks); todoImported("Merged"); }),
+          btn("Replace", () => { todo.tasks = todoImp.tasks; todoImported("Replaced"); }, "danger"),
+          btn("Cancel", () => { todoImp = null; fillTodoData(); relayout(); }))));
+    }
+  }
+  todoBox.replaceChildren(...rows);
+  todoBox.style.display = rows.length ? "" : "none";
+}
+function todoImported(t) { todoImp = null; todoSave(); fillTodoData(); relayout(); flash(t + " tasks"); }
+async function exportTodos() {
+  dialogOpen = true;
+  try {
+    const dest = await T.dialog.save({ defaultPath: "floaty-todos.json", filters: [{ name: "JSON", extensions: ["json"] }] });
+    if (dest) await invoke("export_todos", { dest, text: Todo.exportJSON(todo.tasks) });
+  } catch (e) { console.error(e); } finally { dialogOpen = false; }
+}
+async function importTodos() {
+  dialogOpen = true;
+  try {
+    const src = await T.dialog.open({ filters: [{ name: "JSON", extensions: ["json"] }] });
+    if (!src) return;
+    todoImp = Todo.parseImport(await invoke("import_todos", { src }));
+  } catch (e) { todoImp = null; flash("Not a task list"); } finally { dialogOpen = false; }
+  fillTodoData(); relayout();
+}
+
 // ------------------------------------------------------------ settings
 function vSettings() {
   const s = S();
@@ -659,15 +723,20 @@ function vSettings() {
       wid("timer", "Timer", "Shows in the pill while running"),
       wid("media", "Now playing", "Controls for Spotify, YouTube and more", (v) => v && pollMedia()),
       wid("battery", "Battery", null, (v) => v && initBatt()),
-      wid("clip", "Clipboard history", "Kept in memory only", (v) => v && pollClip())),
+      wid("clip", "Clipboard history", "Kept in memory only", (v) => v && pollClip()),
+      wid("todo", "Todo and plan", "Daily list and month planner, can pop out into its own window", async (v) => {
+        if (v) await todoLoad(); else await todoOff();
+        fillTodoData(); relayout();
+      })),
     grp("Profiles", "folders",
       row("Active profile", null, profSeg, "col"),
       h("div", { class: "rw" }, h("input", { class: "fld", value: p.name, onchange: (e) => { p.name = e.target.value || p.name; save(); commit(false); } })),
       h("div", { class: "rw" },
         h("button", { class: "btn", onclick: () => { const n = { id: uid(), name: "Profile " + (cfg.profiles.length + 1), items: [] }; cfg.profiles.push(n); cfg.active = n.id; save(); commit(false); } }, "New profile"),
         cfg.profiles.length > 1 && h("button", { class: "btn danger", onclick: () => { cfg.profiles = cfg.profiles.filter((x) => x !== p); cfg.active = cfg.profiles[0].id; save(); commit(false); } }, "Delete this one"))),
-    grp("Data", "copy", h("div", { class: "rw" }, h("button", { class: "btn", onclick: exportCfg }, "Export backup"), h("button", { class: "btn", onclick: importCfg }, "Import backup"))),
+    grp("Data", "copy", h("div", { class: "rw" }, h("button", { class: "btn", onclick: exportCfg }, "Export backup"), h("button", { class: "btn", onclick: importCfg }, "Import backup")), todoBox = h("div")),
   ];
+  fillTodoData();
   return [hdr([backBtn(), h("span", { class: "ttl" }, "Settings")]), h("div", { class: "scroll" }, body)];
 }
 async function exportCfg() {
@@ -725,7 +794,7 @@ window.addEventListener("blur", () => {
   if (!cfg || !S().outside || S().collapsed || dialogOpen) return;
   setTimeout(() => {
     const a = document.activeElement;
-    if (!document.hasFocus() && !dialogOpen && !S().collapsed && !(a && a.type === "color")) collapse();
+    if (!document.hasFocus() && !dialogOpen && !S().collapsed && !(a && ["color", "month"].includes(a.type))) collapse();
   }, 200);
 });
 document.addEventListener("keydown", (e) => {
@@ -750,6 +819,7 @@ document.addEventListener("contextmenu", (e) => { if (!e.target.closest(".tl")) 
   let raw = null;
   try { raw = JSON.parse(await invoke("load_config")); } catch (_) {}
   cfg = merge(raw);
+  if (S().widgets.todo) await todoLoad();
   await Promise.all(Object.values(native).map((f) => f()));
   if (LABEL === "main") await invoke("set_screens", { mode: S().screen }).catch(() => {});
   invoke("list_monitors").then((m) => { monList = m; }).catch(() => {});
@@ -763,7 +833,17 @@ document.addEventListener("contextmenu", (e) => { if (!e.target.closest(".tl")) 
     cfg = merge(JSON.parse(e.payload.text));
     S().collapsed = keep;
     applyLook();
-    if (!isTyping()) commit(false);
+    if (S().widgets.todo && !todo) todoLoad().then(() => commit(false));
+    else if (!S().widgets.todo && todo) { todo = null; todoRoot = null; if (["todo", "plan"].includes(view)) { view = "quick"; stack = []; } commit(false); }
+    else if (!isTyping()) commit(false);
+  });
+  // another window (the pop-out) saved the todos
+  listen("todos", (e) => {
+    if (e.payload.from === LABEL || !todo) return;
+    const next = Todo.normalize(JSON.parse(e.payload.text));
+    const changed = JSON.stringify(next.tasks) !== JSON.stringify(todo.tasks);
+    todo = next;
+    if (changed && !TodoUI.dragging) todoChanged();
   });
   listen("tm", (e) => {
     if (e.payload.from === LABEL) return;
@@ -772,6 +852,7 @@ document.addEventListener("contextmenu", (e) => { if (!e.target.closest(".tl")) 
     afterTimer();
   });
   listen("hotkey", (e) => { if (S().collapsed) expand(); else if (e.payload === "toggle") collapse(); });
+  if (LABEL === "main" && todo && todo.win.open) popOut();
   if (S().widgets.battery) initBatt();
   if (S().widgets.media) pollMedia();
   setInterval(globalTick, 1000);
