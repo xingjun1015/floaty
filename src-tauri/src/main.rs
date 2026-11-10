@@ -807,7 +807,8 @@ fn learn_tab(id: String) -> Option<String> {
     let ua = uia()?;
     let fg = unsafe { GetForegroundWindow() }.0 as isize;
     let (_, class, _) = top_windows().into_iter().find(|w| w.0 == fg)?;
-    if !BROWSER_CLASSES.contains(&class.as_str()) {
+    // browsers and File Explorer (Windows 11) both expose their tabs
+    if !BROWSER_CLASSES.contains(&class.as_str()) && class != "CabinetWClass" {
         return None;
     }
     for t in tabs_of(&ua, fg) {
@@ -824,6 +825,62 @@ fn learn_tab(id: String) -> Option<String> {
         }
     }
     None
+}
+
+/// Floaty item id -> top-level window that item opened (files, folders and apps without tabs)
+static WINS: std::sync::LazyLock<Mutex<HashMap<String, isize>>> = std::sync::LazyLock::new(Default::default);
+
+/// Handles of the visible top-level windows right now, to tell afterwards which window a launch created.
+#[tauri::command(async)]
+fn window_ids() -> Vec<isize> {
+    top_windows().into_iter().map(|w| w.0).collect()
+}
+
+/// Bring the window this item opened earlier to the front. False if it is gone.
+#[tauri::command(async)]
+fn focus_window(id: String) -> bool {
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE},
+    };
+    let Some(h) = WINS.lock().unwrap().get(&id).copied() else { return false };
+    unsafe {
+        let hw = HWND(h as *mut _);
+        if !IsWindow(Some(hw)).as_bool() || !IsWindowVisible(hw).as_bool() {
+            WINS.lock().unwrap().remove(&id);
+            return false;
+        }
+        if IsIconic(hw).as_bool() {
+            let _ = ShowWindow(hw, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hw);
+    }
+    true
+}
+
+/// Remember the window in front as this item's window, unless it is Floaty, the desktop/taskbar, or was already
+/// open before the launch (`before`). The handle survives navigating inside the window (e.g. to another folder).
+#[tauri::command(async)]
+fn learn_window(id: String, before: Vec<isize>) -> bool {
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
+    };
+    let fg = unsafe { GetForegroundWindow() }.0 as isize;
+    if fg == 0 || before.contains(&fg) {
+        return false;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(HWND(fg as *mut _), Some(&mut pid)) };
+    if pid == std::process::id() {
+        return false;
+    }
+    let Some((_, class, _)) = top_windows().into_iter().find(|w| w.0 == fg) else { return false };
+    if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+        return false;
+    }
+    WINS.lock().unwrap().insert(id, fg);
+    true
 }
 
 #[tauri::command(async)]
@@ -1085,6 +1142,9 @@ fn main() {
             browser_title,
             focus_tab,
             learn_tab,
+            window_ids,
+            focus_window,
+            learn_window,
             start_menu,
             read_clipboard,
             media_info,

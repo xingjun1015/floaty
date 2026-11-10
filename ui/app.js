@@ -206,7 +206,9 @@ function open(it) {
   if (editing) return go("item:" + it.id);
   if (it.kind === "group") return go("group:" + it.id);
   if (it.kind === "snippet") { navigator.clipboard.writeText(it.path).catch(() => {}); return flash("Copied " + it.name); }
-  if (it.kind === "url") return openUrl(it);
+  const reuse = S().reuse !== false; // setting: jump to the already open window/tab instead of opening a new one
+  if (it.kind === "url" && reuse) return openUrl(it);
+  if (reuse && ["folder", "file", "app"].includes(it.kind)) return openTracked(it);
   invoke("launch", { kind: it.kind, path: it.path }).catch((e) => flash(String(e).slice(0, 30)));
 }
 // URLs: jump back to the exact browser tab we opened for this item (also after navigating to other pages), otherwise
@@ -223,6 +225,19 @@ async function openUrl(it) {
     await new Promise((r) => setTimeout(r, 1500));
     const t = await invoke("learn_tab", { id: it.id }).catch(() => null);
     if (t) { it.tab = t; it.tabAuto = true; save(); return; }
+  }
+}
+// Folders, files and apps: jump back to the window this item opened (it survives navigating to another folder),
+// otherwise launch and remember the window it creates. Explorer tabs are remembered like browser tabs.
+async function openTracked(it) {
+  if ((await invoke("focus_tab", { id: it.id, title: "" }).catch(() => null)) != null) return;
+  if (await invoke("focus_window", { id: it.id }).catch(() => false)) return;
+  const before = await invoke("window_ids").catch(() => []);
+  await invoke("launch", { kind: it.kind, path: it.path }).catch((e) => flash(String(e).slice(0, 30)));
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 600));
+    if ((await invoke("learn_tab", { id: it.id }).catch(() => null)) != null) return;
+    if (await invoke("learn_window", { id: it.id, before }).catch(() => false)) return;
   }
 }
 function openFromPill(it, el) {
@@ -634,6 +649,7 @@ function vSettings() {
     grp("Behavior", "adjustments",
       toggle("Always on top", null, () => s.onTop, (v) => { s.onTop = v; native.onTop(); }),
       toggle("Collapse when clicking outside", "Also when you switch to another app", () => s.outside, (v) => { s.outside = v; }),
+      toggle("Reuse open windows", "Clicking an item jumps to its open window or tab; off always opens a new one", () => s.reuse !== false, (v) => { s.reuse = v; }),
       toggle("Auto-hide on hover", "Collapse on mouse leave, open on hover", () => s.autohide, (v) => { s.autohide = v; }),
       toggle("Hide over fullscreen apps", "Per screen", () => s.hideFs, (v) => { s.hideFs = v; native.hideFs(); }),
       toggle("Start with Windows", null, () => s.autostart, (v) => { s.autostart = v; native.autostart(); }),
