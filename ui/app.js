@@ -319,8 +319,12 @@ async function initBatt() {
   ["levelchange", "chargingchange"].forEach((ev) => batt.addEventListener(ev, updLive));
   softRefresh();
 }
+let mediaBusy = false;
 async function pollMedia() {
-  const m = await invoke("media_info");
+  if (mediaBusy) return;
+  mediaBusy = true;
+  const m = await invoke("media_info").catch(() => null).finally(() => { mediaBusy = false; });
+  if (!m) return;
   const changed = JSON.stringify(m) !== JSON.stringify(media);
   media = m;
   if (changed) softRefresh();

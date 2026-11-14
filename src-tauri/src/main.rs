@@ -1097,7 +1097,7 @@ fn read_clipboard() -> Option<String> {
         .filter(|t| !t.trim().is_empty())
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, Clone)]
 struct Media {
     active: bool,
     playing: bool,
@@ -1121,9 +1121,26 @@ fn media_now() -> windows::core::Result<Media> {
     })
 }
 
-#[tauri::command(async)]
+/// The system media query can block for 10+ seconds (or forever), so it never runs on a command thread:
+/// one worker refreshes MEDIA while somebody is asking, and the command just returns the cached value.
+static MEDIA: Mutex<Option<(Media, Instant)>> = Mutex::new(None);
+static MEDIA_ASKED: Mutex<Option<Instant>> = Mutex::new(None);
+
+#[tauri::command]
 fn media_info() -> Media {
-    media_now().unwrap_or_default()
+    static START: std::sync::Once = std::sync::Once::new();
+    *MEDIA_ASKED.lock().unwrap() = Some(Instant::now());
+    START.call_once(|| {
+        std::thread::spawn(|| loop {
+            let asked = MEDIA_ASKED.lock().unwrap().map_or(false, |t| t.elapsed() < Duration::from_secs(20));
+            if asked {
+                let m = media_now().unwrap_or_default();
+                *MEDIA.lock().unwrap() = Some((m, Instant::now()));
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        });
+    });
+    MEDIA.lock().unwrap().as_ref().map(|(m, _)| m.clone()).unwrap_or_default()
 }
 
 #[tauri::command(async)]
