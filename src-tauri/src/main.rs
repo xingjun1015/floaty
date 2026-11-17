@@ -591,6 +591,25 @@ fn fullscreen_monitor(own: &HashSet<isize>) -> Option<(i32, i32)> {
     }
 }
 
+/// Other topmost windows (browser popups, taskbar, tray flyouts) can end up above us in the topmost band,
+/// and Windows can drop the flag. Re-assert it; no-op when already on top. Called from the 2s watcher.
+fn raise_topmost(w: &WebviewWindow) {
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{
+            GetWindow, SetWindowPos, GW_HWNDPREV, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        },
+    };
+    let Ok(h) = w.hwnd() else { return };
+    unsafe {
+        // nothing above us in z-order: already on top, skip the call (no needless window-pos messages)
+        if GetWindow(HWND(h.0), GW_HWNDPREV).is_ok() {
+            return;
+        }
+        let _ =SetWindowPos(HWND(h.0), Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
 fn watch_fullscreen(app: AppHandle) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(2));
@@ -607,6 +626,9 @@ fn watch_fullscreen(app: AppHandle) {
         };
         let ms = mons(&app);
         for (label, w) in &wins {
+            if w.is_always_on_top().unwrap_or(false) {
+                raise_topmost(w);
+            }
             let idx = st.mon.lock().unwrap().get(label).copied().unwrap_or(0);
             let pos = if label == TODO {
                 w.current_monitor().ok().flatten().map(|m| (m.position().x, m.position().y))
