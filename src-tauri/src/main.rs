@@ -669,8 +669,8 @@ unsafe extern "system" fn win_event_proc(
 /// (The 2s watcher stays as a backstop.) Needs its own thread with a message loop for the hook.
 fn hook_zorder(app: AppHandle) {
     use windows::Win32::UI::{
-        Accessibility::{SetWinEventHook, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MOVESIZEEND},
-        WindowsAndMessaging::{DispatchMessageW, GetMessageW, TranslateMessage, MSG, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS},
+        Accessibility::{SetWinEventHook},
+        WindowsAndMessaging::{DispatchMessageW, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MOVESIZEEND, GetMessageW, TranslateMessage, MSG, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS},
     };
     let _ = HOOK_APP.set(app);
     std::thread::spawn(|| unsafe {
