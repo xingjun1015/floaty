@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
         Mutex,
     },
     time::{Duration, Instant},
@@ -343,6 +343,9 @@ fn set_dock(app: AppHandle, st: State<St>, dock: String) {
 #[tauri::command]
 fn set_on_top(app: AppHandle, st: State<St>, on: bool) {
     st.on_top.store(on, Relaxed);
+    if !on {
+        note_unpin();
+    }
     for w in app.webview_windows().values() {
         if w.label() != TODO {
             let _ = w.set_always_on_top(on);
@@ -543,6 +546,9 @@ fn todo_window(app: AppHandle, open: bool, geo: Option<Geo>) -> Result<(), Strin
 /// The pop-out's own "keep on top" pin. tao rewrites the window styles here, so strip the frame bits again.
 #[tauri::command]
 fn todo_top(w: WebviewWindow, on: bool) {
+    if !on {
+        note_unpin();
+    }
     let _ = w.set_always_on_top(on);
     strip_frame(&w);
 }
@@ -600,14 +606,90 @@ fn raise_topmost(w: &WebviewWindow) {
             GetWindow, SetWindowPos, GW_HWNDPREV, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
         },
     };
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TOPMOST};
     let Ok(h) = w.hwnd() else { return };
+    let h = HWND(h.0);
+    // SAFETY: h is a live window handle from tauri; these calls only read/restack it.
     unsafe {
-        // nothing above us in z-order: already on top, skip the call (no needless window-pos messages)
-        if GetWindow(HWND(h.0), GW_HWNDPREV).is_ok() {
+        // Like PowerToys: read the real WS_EX_TOPMOST bit (the OS or another app can clear it behind
+        // our back), and also check nothing sits above us in z-order. Skip only when both are fine.
+        let has_flag = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0;
+        let nothing_above = GetWindow(h, GW_HWNDPREV).map(|p| p.0.is_null()).unwrap_or(true);
+        if has_flag && nothing_above {
             return;
         }
-        let _ =SetWindowPos(HWND(h.0), Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        let _ = SetWindowPos(h, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
+}
+
+/// Millis (since epoch) of the last user unpin. The hook thread reads the pin flag and re-pins without a
+/// lock, so it could undo an unpin that lands in between; it backs off briefly after one instead.
+static LAST_UNPIN_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn note_unpin() {
+    LAST_UNPIN_MS.store(now_ms(), Relaxed);
+}
+
+fn raise_all_topmost(app: &AppHandle) {
+    if now_ms().saturating_sub(LAST_UNPIN_MS.load(Relaxed)) < 500 {
+        return;
+    }
+    for w in app.webview_windows().values() {
+        if w.is_always_on_top().unwrap_or(false) {
+            raise_topmost(w);
+        }
+    }
+}
+
+static HOOK_APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+unsafe extern "system" fn win_event_proc(
+    _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: windows::Win32::Foundation::HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if let Some(app) = HOOK_APP.get() {
+        raise_all_topmost(app);
+    }
+}
+
+/// PowerToys-style: re-assert topmost when the foreground window changes, focus moves, or a window is
+/// restored from minimize / moved, which is when another app's topmost window usually lands above ours.
+/// (The 2s watcher stays as a backstop.) Needs its own thread with a message loop for the hook.
+fn hook_zorder(app: AppHandle) {
+    use windows::Win32::UI::{
+        Accessibility::{SetWinEventHook, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MOVESIZEEND},
+        WindowsAndMessaging::{DispatchMessageW, GetMessageW, TranslateMessage, MSG, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS},
+    };
+    let _ = HOOK_APP.set(app);
+    std::thread::spawn(|| unsafe {
+        // SAFETY: win_event_proc matches WINEVENTPROC and only touches thread-safe statics; this thread
+        // owns the message loop below, which out-of-context hooks need to be delivered.
+        for ev in [EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MOVESIZEEND] {
+            let h = SetWinEventHook(ev, ev, None, Some(win_event_proc), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+            if h.0.is_null() {
+                // not fatal: the 2s watcher still re-asserts topmost
+                eprintln!("floaty: SetWinEventHook failed for event {ev:#x}");
+            }
+        }
+        let mut msg = MSG::default();
+        // GetMessageW returns -1 on error, which is truthy as a BOOL; only continue on > 0
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    });
 }
 
 fn watch_fullscreen(app: AppHandle) {
@@ -1360,6 +1442,7 @@ fn main() {
             // ponytail: fixed hotkey; make configurable if Alt+Space collides with another tool
             let _ = app.global_shortcut().register("Alt+Space");
             watch_fullscreen(app.handle().clone());
+            hook_zorder(app.handle().clone());
             watch_frame(app.handle().clone());
             Ok(())
         })

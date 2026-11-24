@@ -1,6 +1,6 @@
 {
   "productName": "Floaty",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "identifier": "com.floaty.app",
   "build": { "frontendDist": "../ui" },
   "app": {
