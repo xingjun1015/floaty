@@ -641,7 +641,13 @@ fn raise_all_topmost(app: &AppHandle) {
     if now_ms().saturating_sub(LAST_UNPIN_MS.load(Relaxed)) < 500 {
         return;
     }
-    for w in app.webview_windows().values() {
+    let wins = app.webview_windows();
+    let own: HashSet<isize> = wins.values().filter_map(|w| w.hwnd().ok().map(|h| h.0 as isize)).collect();
+    // never fight a fullscreen app (game/video) for z-order
+    if app.state::<St>().hide_fs.load(Relaxed) && fullscreen_monitor(&own).is_some() {
+        return;
+    }
+    for w in wins.values() {
         if w.is_always_on_top().unwrap_or(false) {
             raise_topmost(w);
         }
@@ -708,7 +714,7 @@ fn watch_fullscreen(app: AppHandle) {
         };
         let ms = mons(&app);
         for (label, w) in &wins {
-            if w.is_always_on_top().unwrap_or(false) {
+            if fs.is_none() && w.is_always_on_top().unwrap_or(false) {
                 raise_topmost(w);
             }
             let idx = st.mon.lock().unwrap().get(label).copied().unwrap_or(0);
